@@ -25,7 +25,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 import org.json.JSONObject;
-import org.kpfe.restore.core.FirmwareImage;
 
 /** Work survives Activity recreation; no automated retry or background restore. */
 public final class RestoreService extends Service {
@@ -52,15 +51,22 @@ public final class RestoreService extends Service {
         else startForeground(1, n);
         final String mode = intent == null ? "" : intent.getStringExtra("mode");
         final int targetVersion = intent == null ? 0 : intent.getIntExtra("targetVersion", 0);
-        final FirmwareImage.Descriptor target;
+        final FirmwareTarget target;
         synchronized (AppState.class) {
             if (AppState.busy) return START_NOT_STICKY;
+            if (AppState.collectingReport) {
+                stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId); return START_NOT_STICKY;
+            }
             if (!"check".equals(mode) && !"restore".equals(mode) && !"entry-test".equals(mode) && !"exit-only".equals(mode) && !"resume-only".equals(mode)) {
                 stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId); return START_NOT_STICKY;
             }
-            try { target = FirmwareImage.forVersion(Integer.toString(targetVersion)); }
+            try {
+                target = FirmwareTarget.forSelection(DeviceIdentity.hint(), targetVersion);
+                if (target.profile == DeviceProfile.FIT && !"check".equals(mode) && !"restore".equals(mode))
+                    throw new IllegalArgumentException("Unsupported FIT action");
+            }
             catch (IllegalArgumentException invalid) {
-                fail("FAILED", "Choose one of the included stock firmware versions.");
+                fail("FAILED", "This device or firmware selection is unsupported. FIT and Elite images cannot be mixed.");
                 AppState.persist(this);
                 stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId); return START_NOT_STICKY;
             }
@@ -93,7 +99,7 @@ public final class RestoreService extends Service {
             // restore must not let our own UI silently allow display sleep.
             if (mode.equals("restore")) AppState.holdScreenForRecovery = true;
             AppState.packet = 0; AppState.total = 0;
-            AppState.title = mode.equals("restore") ? "Preparing restore" : mode.equals("entry-test") ? "Testing update-mode entry" : mode.equals("exit-only") ? "Exiting update mode" : mode.equals("resume-only") ? "Resuming AYANEO controls" : "Checking your Elite";
+            AppState.title = mode.equals("restore") ? "Preparing restore" : mode.equals("entry-test") ? "Testing update-mode entry" : mode.equals("exit-only") ? "Exiting update mode" : mode.equals("resume-only") ? "Resuming AYANEO controls" : "Checking the controller";
             AppState.message = "Grant access when your root manager asks.";
             AppState.status = "RUNNING";
             AppState.log.setLength(0);
@@ -108,7 +114,7 @@ public final class RestoreService extends Service {
         return START_NOT_STICKY;
     }
 
-    private void run(String mode, FirmwareImage.Descriptor target) {
+    private void run(String mode, FirmwareTarget target) {
         resultSeen = false;
         sessionTrace = null;
         traceWarningReported = false;
@@ -121,14 +127,16 @@ public final class RestoreService extends Service {
                 throw new IOException("Free at least 32 MB of internal storage for the restore diagnostics.");
             File traceFile = File.createTempFile("session-" + mode + "-", ".log", traceDirectory);
             sessionTrace = new SessionTrace(traceFile);
-            sessionTrace.append("KPFE Controller Firmware Restore 0.4.2-preview; mode=" + mode
+            sessionTrace.append("Controller FW Restore 0.5.0-preview; mode=" + mode
                     + "; targetVersion=" + target.version + "; trace=" + traceFile.getName());
             if (!sessionTrace.failure().isEmpty()) throw new IOException(sessionTrace.failure());
             AppState.append("Full session trace: " + traceFile.getAbsolutePath());
             getSharedPreferences("restore", 0).edit().putString("lastTracePath", traceFile.getAbsolutePath())
                     .putBoolean("lastTraceComplete", false).putString("lastTraceFailure", "").commit();
-            if (!"PocketFITElite".equals(Build.DEVICE) || !"Pocket FIT Elite".equals(Build.MODEL))
-                throw new IOException("This app supports Pocket FIT Elite only. Detected: " + Build.MODEL + " / " + Build.DEVICE);
+            DeviceIdentity.Snapshot identity = DeviceIdentity.read();
+            if (identity.profile != target.profile || identity.profile == DeviceProfile.UNSUPPORTED)
+                throw new IOException("Device identity does not match the selected firmware: " + identity.description());
+            sessionTrace.append("Verified device profile: " + identity.profile + "; " + identity.description());
             Intent battery = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
             if (battery == null) throw new IOException("Could not read battery level.");
             int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
@@ -141,9 +149,11 @@ public final class RestoreService extends Service {
             File firmware = prepareFirmware(target);
             File nativeLibrary = new File(getApplicationInfo().nativeLibraryDir, "libserial_port.so");
             if (!nativeLibrary.isFile()) throw new IOException("The stock serial library is missing. Reinstall this build.");
+            String helper = target.profile == DeviceProfile.FIT ? "org.kpfe.restore.FitRootMain" : "org.kpfe.restore.RootMain";
             String command = "exec /system/bin/app_process -cp " + quote(getApplicationInfo().sourceDir)
-                + " / org.kpfe.restore.RootMain " + mode + " " + quote(firmware.getCanonicalPath())
-                + " " + quote(nativeLibrary.getCanonicalPath()) + " " + quote(target.version);
+                + " / " + helper + " " + mode + " " + quote(firmware.getCanonicalPath())
+                + " " + quote(nativeLibrary.getCanonicalPath())
+                + (target.profile == DeviceProfile.ELITE ? " " + quote(target.version) : "");
             synchronized (sessionLock) {
                 if (destroyed) throw new IOException("The service stopped before starting the helper.");
                 rootProcess = startRoot(command);
@@ -233,23 +243,23 @@ public final class RestoreService extends Service {
         throw new IOException("No root manager found. This app needs an already-rooted device.");
     }
 
-    private File prepareFirmware(FirmwareImage.Descriptor target) throws Exception {
+    private File prepareFirmware(FirmwareTarget target) throws Exception {
         File dest = new File(getFilesDir(), target.assetName);
         File tmp = new File(getFilesDir(), "firmware.tmp");
         final byte[] bytes;
         try (InputStream input = getAssets().open(target.assetName)) {
-            bytes = FirmwareImage.read(target, input).copyBytes();
+            bytes = target.read(input);
         }
         try (FileOutputStream output = new FileOutputStream(tmp)) {
             output.write(bytes);
             output.getFD().sync();
         }
         if (!tmp.renameTo(dest)) { tmp.delete(); throw new IOException("Could not prepare verified firmware."); }
-        AppState.append("Bundled firmware v" + target.version + " verified: " + bytes.length + " bytes; SHA-256 " + target.sha256);
+        AppState.append("Bundled " + target.label + " verified: " + bytes.length + " bytes; SHA-256 " + target.sha256);
         return dest;
     }
 
-    private void receive(String line, String mode, FirmwareImage.Descriptor target) {
+    private void receive(String line, String mode, FirmwareTarget target) {
         if (sessionTrace != null) { sessionTrace.append(line); reportTraceWarning(); }
         AppState.append(line);
         Log.i("EliteRestore", line);
@@ -267,28 +277,37 @@ public final class RestoreService extends Service {
                 if (e.has("packetCount")) AppState.total = e.optInt("packetCount", 0);
                 if (e.has("packetIndex") && e.optInt("packetIndex", -1) >= 0) AppState.packet = e.optInt("packetIndex", 0);
                 String phase = e.optString("phase", "");
-                if (!phase.isEmpty()) { AppState.title = titleFor(phase); AppState.message = messageFor(phase, mode); }
+                if (!phase.isEmpty()) {
+                    AppState.title = titleFor(phase);
+                    AppState.message = target.profile == DeviceProfile.FIT && e.has("message")
+                            ? e.optString("message") : messageFor(phase, mode);
+                }
                 if (e.optString("event").equals("result")) {
                     resultSeen = true;
                     AppState.status = e.optString("status", "INDETERMINATE");
                     if (mode.equals("restore")) {
                         // Success clears the hold only after clean helper exit.
                         if (AppState.status.equals("FAILED")
-                                || (e.has("flashMayHaveStarted") && !e.optBoolean("flashMayHaveStarted", true)))
+                                || (e.has("flashMayHaveStarted") && !e.optBoolean("flashMayHaveStarted", true)
+                                && !e.optBoolean("controlStateChanged", false)))
                             AppState.holdScreenForRecovery = inheritedRecoveryHold;
                     }
                     if (e.has("packetsAcknowledged")) AppState.packet = e.optInt("packetsAcknowledged", 0);
                     AppState.ready = mode.equals("check") && AppState.status.equals("CHECK_OK");
                     if (AppState.ready) {
                         AppState.readyAt = SystemClock.elapsedRealtime();
-                        AppState.checkedFirmwareVersion = Integer.parseInt(target.version);
-                        AppState.title = "Ready to restore v" + target.version;
+                        AppState.checkedFirmwareVersion = target.selection;
+                        AppState.title = "Ready to restore " + target.label;
                         AppState.message = "Root, device and firmware checks passed.\nRestore starts after your confirmation.";
                     }
                     else if (AppState.status.equals("SUCCESS")) {
                         if (mode.equals("resume-only")) { AppState.title = "AYANEO controls reinitialized"; AppState.message = "The stock display off/on sequence completed and normal controller state was observed. Android was not rebooted. Check all buttons and sticks now."; }
                         else if (mode.equals("exit-only")) { AppState.title = "Startup message received"; AppState.message = "The installed firmware's startup message was received and stock initialization completed. No firmware data was sent. Check the buttons, sticks and AYANEO quick menu now."; }
                         else if (mode.equals("entry-test")) { AppState.title = "Entry test completed"; AppState.message = "Update-mode and application startup messages were received, then stock initialization completed. No firmware data was sent. Check the buttons, sticks and AYANEO quick menu now."; }
+                        else if (target.profile == DeviceProfile.FIT) {
+                            AppState.title = "FIT transfer completed";
+                            AppState.message = "The supplied image was sent and the controller returned to normal USB mode. Check all buttons and sticks. Physical input and flash contents have not been verified.";
+                        }
                         else {
                             AppState.title = "v" + target.version + " transfer completed";
                             AppState.message = "The selected stock image was sent, the controller restarted and normal initialization completed. Check the reported version, sticks, buttons and RGB now.";
@@ -315,11 +334,11 @@ public final class RestoreService extends Service {
         String p = phase.toUpperCase(java.util.Locale.ROOT);
         if (p.equals("WAITING_FOR_RESPONSE_DELAYED")) return "Waiting for the controller";
         if (p.equals("REINITIALIZING")) return "Reinitializing AYANEO controls";
-        if (p.equals("SENDING") || p.equals("WAITING_FOR_RESPONSE") || p.contains("WRITE") || p.contains("TRANSFER") || p.contains("PACKET")) return "Restoring stock firmware";
+        if (p.startsWith("SENDING") || p.equals("RESPONSE_RECEIVED") || p.equals("WAITING_FOR_RESPONSE") || p.contains("WRITE") || p.contains("TRANSFER") || p.contains("PACKET")) return "Restoring stock firmware";
         if (p.contains("BOOT") || p.contains("ENTER")) return "Entering update mode";
         if (p.contains("QUIT") || p.contains("RESTART") || p.contains("APPLICATION")) return "Waiting for the controller";
         if (p.contains("CLEAN") || p.contains("RESUME")) return "Restoring normal operation";
-        return "Checking your Elite";
+        return "Checking the controller";
     }
 
     private String messageFor(String phase, String mode) {

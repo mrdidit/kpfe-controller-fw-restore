@@ -23,6 +23,11 @@
 !/updater/KPFE-stock/KPFE_KR02_v9.bin
 !/updater/KPFE-stock/SHA256SUMS
 !/updater/KPFE-stock/README.md
+!/updater/Pocket-FIT/
+/updater/Pocket-FIT/*
+!/updater/Pocket-FIT/Pocket_FIT_supplied.bin
+!/updater/Pocket-FIT/SHA256SUMS
+!/updater/Pocket-FIT/README.md
 
 **/__pycache__/
 *.py[cod]

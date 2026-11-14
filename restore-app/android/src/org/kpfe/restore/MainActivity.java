@@ -16,6 +16,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.net.Uri;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -30,10 +31,14 @@ import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.text.DateFormat;
 import java.text.NumberFormat;
 import java.util.Date;
-import org.kpfe.restore.core.FirmwareImage;
 
 /** Small framework-only UI: no accounts, storage permission or network dependency. */
 public final class MainActivity extends Activity {
@@ -42,17 +47,22 @@ public final class MainActivity extends Activity {
     private TextView heading, detail, badge, progressText, installedVersion, versionChecked, targetDetail;
     private ProgressBar progress;
     private Button action, recheck, diagnosticEntry, diagnosticExit, diagnosticRecovery;
+    private Button diagnosticReport, diagnosticLastReport;
     private TextView diagnosticHint;
     private AlertDialog diagnosticsMenu;
     private RadioGroup targetChoice;
     private RadioButton targetV8, targetV9;
     private boolean renderingSelection;
+    private final DeviceProfile profile = DeviceIdentity.hint();
+    private static final int EXPORT_REPORT = 702;
+    private String pendingReportPath;
     private final Runnable refresh = new Runnable() {
         @Override public void run() { render(); handler.postDelayed(this, 250); }
     };
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        if (state != null) pendingReportPath = state.getString("pendingReportPath");
         BG = getColor(R.color.app_background); CARD = getColor(R.color.app_card);
         SECONDARY = getColor(R.color.app_secondary);
         INK = getColor(R.color.app_ink); MUTED = getColor(R.color.app_muted); ACCENT = getColor(R.color.app_accent);
@@ -93,7 +103,8 @@ public final class MainActivity extends Activity {
         splash.setLayerType(View.LAYER_TYPE_SOFTWARE, null);
         splash.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         title.addView(splash, new FrameLayout.LayoutParams(Math.min(width, dp(520)), dp(64), Gravity.CENTER));
-        TextView hero = text("KPFE Controller Firmware Restore", 20, 0xff25261d);
+        TextView hero = text(profile == DeviceProfile.FIT ? "Pocket FIT Controller Firmware Restore"
+                : profile == DeviceProfile.ELITE ? "KPFE Controller Firmware Restore" : "Controller Firmware Restore", 20, 0xff25261d);
         hero.setTypeface(null, Typeface.BOLD);
         hero.setGravity(Gravity.CENTER);
         hero.setMaxLines(1);
@@ -139,6 +150,9 @@ public final class MainActivity extends Activity {
         targetChoice = new RadioGroup(this);
         targetChoice.setOrientation(LinearLayout.HORIZONTAL);
         targetV8 = targetOption("Version 8"); targetV9 = targetOption("Version 9");
+        if (profile == DeviceProfile.FIT) {
+            targetV8.setText("Supplied FIT image"); targetV9.setVisibility(View.GONE);
+        } else if (profile == DeviceProfile.UNSUPPORTED) targetChoice.setVisibility(View.GONE);
         targetChoice.addView(targetV8, new RadioGroup.LayoutParams(0, -2, 1f));
         targetChoice.addView(targetV9, new RadioGroup.LayoutParams(0, -2, 1f));
         add(firmware, targetChoice, 4);
@@ -152,15 +166,15 @@ public final class MainActivity extends Activity {
         add(firmware, text("Root required. Battery: 30%, or 15% with charger connected.", 10.5f, MUTED), 12);
         targetChoice.setOnCheckedChangeListener((group, checked) -> {
             if (renderingSelection) return;
-            int selected = checked == targetV9.getId() ? 9 : 8;
+            int selected = profile == DeviceProfile.FIT ? FirmwareTarget.FIT_SUPPLIED : checked == targetV9.getId() ? 9 : 8;
             synchronized (AppState.class) {
-                if (AppState.busy) { render(); return; }
+                if (AppState.busy || AppState.collectingReport) { render(); return; }
                 if (selected == AppState.selectedFirmwareVersion) return;
                 AppState.selectedFirmwareVersion = selected;
                 AppState.ready = false;
                 AppState.status = "NEEDS_CHECK";
                 AppState.title = "Target firmware changed";
-                AppState.message = "Check this device before restoring version " + selected + ".";
+                AppState.message = "Check this device before restoring " + FirmwareTarget.forSelection(profile, selected).label + ".";
                 AppState.persist(this);
             }
             render();
@@ -187,7 +201,7 @@ public final class MainActivity extends Activity {
         add(controls, action, 6);
         action.setOnClickListener(v -> {
             boolean ready;
-            synchronized (AppState.class) { if (AppState.busy) return; ready = AppState.ready; }
+            synchronized (AppState.class) { if (AppState.busy || AppState.collectingReport) return; ready = AppState.ready; }
             if (ready) confirmRestore(); else begin("check");
         });
         recheck = button("Check again", ACCENT, BG);
@@ -204,12 +218,19 @@ public final class MainActivity extends Activity {
         final int target;
         final String installed;
         synchronized (AppState.class) {
-            if (AppState.busy) return;
+            if (AppState.busy || AppState.collectingReport) return;
             target = AppState.selectedFirmwareVersion;
             installed = installedVersionLabel();
         }
-        String evidence = target == 9 ? "Restoring v9 through this app has not yet been tested. "
-                : "The v8 restore and v9 → v8 paths were tested with app 0.3. ";
+        if (profile == DeviceProfile.FIT) {
+            new AlertDialog.Builder(this).setTitle("Restore Pocket FIT firmware?")
+                .setMessage("Target: the supplied Pocket FIT image (79,692 bytes). Its version number is unconfirmed.\n\n"
+                    + "The app checks this FIT's identity, looks for the stock USB bootloader, and requests software entry only if needed. Keep power connected and the app visible. Do not restart or close it during transfer.\n\n"
+                    + "FIT support has passed offline checks but has not been tested on a physical FIT. It cannot recover a controller whose bootloader and software entry are both unavailable.")
+                .setNegativeButton("Cancel", null).setPositiveButton("Restore FIT", (d, w) -> begin("restore", target)).show();
+            return;
+        }
+        String evidence = "v8 → v8, v9 → v8 and v8 → v9 have been tested on a working Elite. ";
         new AlertDialog.Builder(this).setTitle("Restore controller firmware v" + target + "?")
             .setMessage("AYANEO-reported installed firmware: " + installed + "\nFirmware to write: stock v" + target
                 + "\n\nKeep power connected and leave this app visible with the screen on until its final display off/on step. Do not close the app or restart during transfer. A delayed reply keeps the app waiting without retrying.\n\n"
@@ -225,14 +246,19 @@ public final class MainActivity extends Activity {
 
     private void begin(String mode, int target) {
         synchronized (AppState.class) {
-            if (AppState.busy) return;
+            if (AppState.busy || AppState.collectingReport) return;
+            try { FirmwareTarget.forSelection(profile, target); }
+            catch (IllegalArgumentException invalid) { showError("This device or selected firmware is unsupported."); return; }
+            if (profile == DeviceProfile.FIT && !mode.equals("check") && !mode.equals("restore")) {
+                showError("That action is available only for Elite controllers."); return;
+            }
             if (AppState.holdScreenForRecovery && !mode.equals("check") && !mode.equals("restore")) {
                 new AlertDialog.Builder(this).setTitle("Firmware state unresolved")
                     .setMessage("Exit and reinitialization are unavailable while a restore may be incomplete. Keep power connected and this app visible.")
                     .setPositiveButton("Close", null).show();
                 return;
             }
-            if (target != AppState.selectedFirmwareVersion || (target != 8 && target != 9)
+            if (target != AppState.selectedFirmwareVersion
                     || (!mode.equals("check") && !mode.equals("resume-only")
                     && (!AppState.ready || target != AppState.checkedFirmwareVersion
                     || SystemClock.elapsedRealtime() - AppState.readyAt > AppState.CHECK_TTL_MS))) {
@@ -254,33 +280,42 @@ public final class MainActivity extends Activity {
             if (!AppState.busy && AppState.ready && SystemClock.elapsedRealtime() - AppState.readyAt > AppState.CHECK_TTL_MS) {
                 AppState.ready = false; AppState.title = "Check again first"; AppState.message = "Device checks expire after five minutes. Run a fresh check before continuing.";
             }
-            heading.setText(AppState.title);
+            heading.setText(AppState.collectingReport ? "Collecting one support report" : AppState.title);
             installedVersion.setText(installedVersionLabel());
             versionChecked.setText(AppState.currentFirmwareVersionObservedAtMillis > 0
                     ? "Reported by AYANEO · checked " + DateFormat.getTimeInstance(DateFormat.SHORT)
                         .format(new Date(AppState.currentFirmwareVersionObservedAtMillis))
+                    : profile == DeviceProfile.FIT ? "FIT firmware version is not inferred from the supplied image."
                     : "Run a device check to read the installed version.");
             renderingSelection = true;
             targetChoice.check(AppState.selectedFirmwareVersion == 9 ? targetV9.getId() : targetV8.getId());
             renderingSelection = false;
-            targetV8.setEnabled(!AppState.busy); targetV9.setEnabled(!AppState.busy);
-            FirmwareImage.Descriptor selectedImage = FirmwareImage.forVersion(Integer.toString(AppState.selectedFirmwareVersion));
-            targetDetail.setText("Verified stock image · " + NumberFormat.getIntegerInstance().format(selectedImage.size) + " bytes");
+            targetV8.setEnabled(!AppState.busy && !AppState.collectingReport); targetV9.setEnabled(!AppState.busy && !AppState.collectingReport);
+            if (profile == DeviceProfile.UNSUPPORTED) {
+                targetDetail.setText("Unsupported device: " + Build.MODEL + " / " + Build.DEVICE + ". No firmware can be written.");
+            } else {
+                FirmwareTarget selectedImage = FirmwareTarget.forSelection(profile, AppState.selectedFirmwareVersion);
+                targetDetail.setText((profile == DeviceProfile.FIT ? "Hash-verified supplied image · version unconfirmed\n" : "Verified stock image · ")
+                        + NumberFormat.getIntegerInstance().format(selectedImage.size) + " bytes");
+            }
             String description = AppState.message.length() > 1600 ? AppState.message.substring(0, 1600) + "… See diagnostics." : AppState.message;
             if (!AppState.busy && AppState.holdScreenForRecovery)
                 description += "\n\nFirmware may be incomplete. Keep power connected, this app visible and the screen on. Do not reboot or try an exit/reset while the recovery state is unresolved.";
-            detail.setText(description);
-            badge.setText(AppState.busy ? "IN PROGRESS" : AppState.ready ? "CHECKS PASSED" : "ROOTED ELITE ONLY");
-            action.setEnabled(!AppState.busy);
-            action.setText(AppState.busy ? (AppState.mode.equals("restore") ? "Restoring…" : AppState.mode.equals("check") ? "Checking…" : "Working…") : AppState.ready ? "Restore firmware v" + AppState.selectedFirmwareVersion : "Check root & device");
-            recheck.setVisibility(AppState.ready && !AppState.busy ? View.VISIBLE : View.GONE);
+            detail.setText(AppState.collectingReport ? "Collecting device, USB and controller state plus the complete latest session log. No controller commands are sent." : description);
+            badge.setText(AppState.collectingReport ? "COLLECTING REPORT" : AppState.busy ? "IN PROGRESS" : AppState.ready ? "CHECKS PASSED"
+                    : profile == DeviceProfile.FIT ? "ROOTED FIT ONLY" : profile == DeviceProfile.ELITE ? "ROOTED ELITE ONLY" : "UNSUPPORTED DEVICE");
+            action.setEnabled(!AppState.busy && !AppState.collectingReport && profile != DeviceProfile.UNSUPPORTED);
+            action.setText(AppState.collectingReport ? "Collecting report…" : AppState.busy ? (AppState.mode.equals("restore") ? "Restoring…" : AppState.mode.equals("check") ? "Checking…" : "Working…")
+                    : profile == DeviceProfile.UNSUPPORTED ? "Unsupported device" : AppState.ready
+                    ? (profile == DeviceProfile.FIT ? "Restore FIT firmware" : "Restore firmware v" + AppState.selectedFirmwareVersion) : "Check root & device");
+            recheck.setVisibility(AppState.ready && !AppState.busy && !AppState.collectingReport ? View.VISIBLE : View.GONE);
             refreshDiagnosticActions();
-            progress.setVisibility(AppState.busy ? View.VISIBLE : View.GONE);
-            progressText.setVisibility(AppState.busy ? View.VISIBLE : View.GONE);
-            progress.setIndeterminate(AppState.total <= 0);
+            progress.setVisibility(AppState.busy || AppState.collectingReport ? View.VISIBLE : View.GONE);
+            progressText.setVisibility(AppState.busy || AppState.collectingReport ? View.VISIBLE : View.GONE);
+            progress.setIndeterminate(AppState.collectingReport || AppState.total <= 0);
             if (AppState.total > 0) { progress.setMax(AppState.total); progress.setProgress(AppState.packet); }
-            progressText.setText(AppState.total > 0 ? AppState.packet + " / " + AppState.total + " packets" : "No controller buttons needed");
-            if (AppState.busy || AppState.holdScreenForRecovery) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            progressText.setText(AppState.collectingReport ? "One ZIP report · up to one minute" : AppState.total > 0 ? AppState.packet + " / " + AppState.total + " packets" : "No controller buttons needed");
+            if (AppState.busy || AppState.collectingReport || AppState.holdScreenForRecovery) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         }
     }
@@ -297,11 +332,21 @@ public final class MainActivity extends Activity {
         panel.addView(diagnosticEntry);
         add(panel, diagnosticExit, 6);
         add(panel, diagnosticRecovery, 6);
+        if (profile != DeviceProfile.ELITE) {
+            diagnosticEntry.setVisibility(View.GONE); diagnosticExit.setVisibility(View.GONE);
+            diagnosticRecovery.setVisibility(View.GONE);
+        }
         diagnosticHint = text("", 13, MUTED);
         add(panel, diagnosticHint, 8);
         Button logs = button("View logs", ACCENT, BG);
         logs.setMinHeight(dp(48));
         add(panel, logs, 10);
+        diagnosticReport = button("Collect & export one support report", ACCENT, BG);
+        diagnosticReport.setMinHeight(dp(48));
+        add(panel, diagnosticReport, 6);
+        diagnosticLastReport = button("Export last report", ACCENT, BG);
+        diagnosticLastReport.setMinHeight(dp(48));
+        add(panel, diagnosticLastReport, 6);
         ScrollView sc = new ScrollView(this); sc.addView(panel);
         final AlertDialog menu = new AlertDialog.Builder(this).setTitle("Diagnostics").setView(sc)
             .setPositiveButton("Close", null).create();
@@ -309,11 +354,14 @@ public final class MainActivity extends Activity {
         menu.setOnDismissListener(d -> {
             diagnosticsMenu = null; diagnosticEntry = null; diagnosticExit = null;
             diagnosticRecovery = null; diagnosticHint = null;
+            diagnosticReport = null; diagnosticLastReport = null;
         });
         diagnosticEntry.setOnClickListener(v -> { menu.dismiss(); confirmDiagnosticAction("entry-test"); });
         diagnosticExit.setOnClickListener(v -> { menu.dismiss(); confirmDiagnosticAction("exit-only"); });
         diagnosticRecovery.setOnClickListener(v -> { menu.dismiss(); confirmDiagnosticAction("resume-only"); });
         logs.setOnClickListener(v -> { menu.dismiss(); showLog(); });
+        diagnosticReport.setOnClickListener(v -> { menu.dismiss(); collectSupportReport(); });
+        diagnosticLastReport.setOnClickListener(v -> { menu.dismiss(); exportLastReport(); });
         menu.show();
         refreshDiagnosticActions();
     }
@@ -321,13 +369,19 @@ public final class MainActivity extends Activity {
     private void refreshDiagnosticActions() {
         if (diagnosticsMenu == null || diagnosticEntry == null) return;
         synchronized (AppState.class) {
-            boolean recoveryAllowed = !AppState.busy && !AppState.holdScreenForRecovery;
+            boolean recoveryAllowed = !AppState.busy && !AppState.collectingReport
+                    && !AppState.holdScreenForRecovery && profile == DeviceProfile.ELITE;
             boolean checked = hasFreshTargetCheck();
             // An idle tap can explain a missing check; it must never silently do nothing.
             diagnosticEntry.setEnabled(recoveryAllowed);
             diagnosticExit.setEnabled(recoveryAllowed);
             diagnosticRecovery.setEnabled(recoveryAllowed);
-            diagnosticHint.setText(AppState.busy ? "A controller session is running. Logs remain available."
+            diagnosticReport.setEnabled(!AppState.busy && !AppState.collectingReport);
+            diagnosticLastReport.setVisibility(getSharedPreferences("restore", 0).contains("lastSupportReportPath") ? View.VISIBLE : View.GONE);
+            diagnosticLastReport.setEnabled(!AppState.busy && !AppState.collectingReport);
+            diagnosticHint.setText(AppState.collectingReport ? "Collecting a single report. Controller actions are paused."
+                    : AppState.busy ? "A controller session is running. Logs remain available. Collect the report after it finishes."
+                    : profile != DeviceProfile.ELITE ? "One passive report includes device and USB state, firmware checks and the complete latest session log. No diagnostic flashing or button presses are needed."
                     : AppState.holdScreenForRecovery ? "Update-mode and reinitialization actions are unavailable while firmware state is unresolved."
                     : !checked ? "A fresh device check is needed. Tap Test or Exit to check first."
                     : "Update-mode actions do not write firmware.");
@@ -346,7 +400,8 @@ public final class MainActivity extends Activity {
         final String blockedReason;
         synchronized (AppState.class) {
             target = AppState.selectedFirmwareVersion;
-            blockedReason = AppState.busy ? "A controller session is running. Wait for it to finish."
+            blockedReason = AppState.collectingReport ? "A support report is being collected. Wait for it to finish."
+                    : AppState.busy ? "A controller session is running. Wait for it to finish."
                     : AppState.holdScreenForRecovery ? "Firmware state is unresolved. Keep power connected and the app visible. Update-mode and reinitialization actions are unavailable."
                     : null;
             needsCheck = !mode.equals("resume-only") && !hasFreshTargetCheck();
@@ -380,8 +435,8 @@ public final class MainActivity extends Activity {
 
     private void showLog() {
         final String log;
-        synchronized (AppState.class) { log = "KPFE Controller Firmware Restore 0.4.2-preview\n" + AppState.status + "\n" + AppState.message
-                + "\n\nSelected target: v" + AppState.selectedFirmwareVersion
+        synchronized (AppState.class) { log = "Controller FW Restore 0.5.0-preview\n" + AppState.status + "\n" + AppState.message
+                + "\n\nSelected target: " + (profile == DeviceProfile.FIT ? "supplied Pocket FIT firmware; version unconfirmed" : "v" + AppState.selectedFirmwareVersion)
                 + "\nInstalled firmware: " + installedVersionLabel()
                 + "\nVersion source: " + AppState.currentFirmwareVersionSource
                 + "\nObserved at (epoch ms): " + AppState.currentFirmwareVersionObservedAtMillis
@@ -409,6 +464,95 @@ public final class MainActivity extends Activity {
         if (value == null || value.isEmpty() || value.equalsIgnoreCase("unknown") || value.equalsIgnoreCase("unavailable"))
             return AppState.currentFirmwareVersionObservedAtMillis > 0 ? "Unavailable" : "Not checked";
         return value.matches("[0-9]+") ? "v" + value : value;
+    }
+
+    private void collectSupportReport() {
+        synchronized (AppState.class) {
+            if (AppState.busy || AppState.collectingReport) { showError("Wait for the current operation to finish."); return; }
+            AppState.collectingReport = true;
+        }
+        render();
+        final android.content.Context application = getApplicationContext();
+        new Thread(() -> {
+            String failure = null;
+            File report = null;
+            try {
+                String latest = application.getSharedPreferences("restore", 0).getString("lastTracePath", "");
+                report = SupportReport.collect(application, latest.isEmpty() ? null : new File(latest));
+                application.getSharedPreferences("restore", 0).edit()
+                        .putString("lastSupportReportPath", report.getAbsolutePath()).commit();
+            } catch (Exception error) { failure = error.getMessage(); }
+            finally { synchronized (AppState.class) { AppState.collectingReport = false; } }
+            final String problem = failure;
+            final File readyReport = report;
+            handler.post(() -> {
+                if (isFinishing() || isDestroyed()) return; // Export last report survives Activity recreation.
+                render();
+                if (readyReport == null) showError("Could not collect the report: " + problem);
+                else exportReport(readyReport);
+            });
+        }, "controller-support-report").start();
+    }
+
+    private void exportLastReport() {
+        synchronized (AppState.class) { if (AppState.busy || AppState.collectingReport) return; }
+        String path = getSharedPreferences("restore", 0).getString("lastSupportReportPath", "");
+        if (path.isEmpty()) { showError("No completed support report is available yet."); return; }
+        exportReport(new File(path));
+    }
+
+    private File verifiedReport(String path) throws IOException {
+        File directory = new File(getFilesDir(), "support-reports").getCanonicalFile();
+        File report = new File(path).getCanonicalFile();
+        if (!directory.equals(report.getParentFile()) || !report.isFile() || !report.getName().endsWith(".zip"))
+            throw new IOException("The private support report is unavailable.");
+        return report;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void exportReport(File report) {
+        try {
+            report = verifiedReport(report.getAbsolutePath());
+            pendingReportPath = report.getAbsolutePath();
+            startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                    .addCategory(Intent.CATEGORY_OPENABLE).setType("application/zip")
+                    .putExtra(Intent.EXTRA_TITLE, report.getName()), EXPORT_REPORT);
+        } catch (Exception error) { showError("Could not export the report: " + error.getMessage()); }
+    }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putString("pendingReportPath", pendingReportPath);
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != EXPORT_REPORT || result != RESULT_OK || data == null || data.getData() == null) return;
+        final Uri destination = data.getData();
+        final String path = pendingReportPath;
+        if (path == null) { showError("Choose Export last report to save the completed capture."); return; }
+        new Thread(() -> {
+            String failure = null;
+            try (FileInputStream input = new FileInputStream(verifiedReport(path));
+                 OutputStream output = getContentResolver().openOutputStream(destination, "w")) {
+                if (output == null) throw new IOException("The selected location could not be opened.");
+                byte[] buffer = new byte[65536];
+                int count;
+                while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                output.flush();
+            } catch (Exception error) { failure = error.getMessage(); }
+            final String problem = failure;
+            handler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (problem == null) Toast.makeText(this, "Support report saved. Share this one ZIP file.", Toast.LENGTH_LONG).show();
+                else showError("Could not save the report: " + problem + ". The original is retained; use Export last report.");
+            });
+        }, "controller-report-export").start();
+    }
+
+    private void showError(String message) {
+        new AlertDialog.Builder(this).setMessage(message).setPositiveButton("Close", null).show();
     }
 
     @Override protected void onResume() { super.onResume(); handler.post(refresh); }

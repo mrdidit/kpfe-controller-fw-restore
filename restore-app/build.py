@@ -15,14 +15,17 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "restore-app"
 BUILD = ROOT / ".build/restore-app"
 DIST = ROOT / "dist"
-VERSION = "0.4.2-preview"
-VERSION_CODE = 6
+VERSION = "0.5.0-preview"
+VERSION_CODE = 7
 NAME = "Controller-FW-Restore-" + VERSION + ".apk"
 FIRMWARE_IMAGES = (
     {"version": "8", "asset": "KPFE_KR02_v8.bin", "bytes": 58568,
      "sha256": "fd48a4b0852e3f888874cf1acce4ca2cfd7225ad3b40581e144d69a6a9f1e3cd"},
     {"version": "9", "asset": "KPFE_KR02_v9.bin", "bytes": 58592,
      "sha256": "1a43b810b4a5d19ea6e41c14b2b4b1b734b2959a12b200f38868221dc01ee0fe"},
+    {"version": "FIT-supplied", "profile": "FIT", "directory": "Pocket-FIT",
+     "asset": "Pocket_FIT_supplied.bin", "bytes": 79692,
+     "sha256": "c152c91813437e7d7124cff477a6e46b230ed1adb83c4ad84c48ad74239f2ba2"},
 )
 NATIVE_LIBRARY = APP / "vendor/arm64-v8a/libserial_port.so"
 NATIVE_APK_ORIGIN = "evidence/2026-09-11-ayasettings-1.1.114-export/apks/000-base.apk"
@@ -37,7 +40,7 @@ def digest(path):
 
 
 def image_path(image):
-    return ROOT / "updater/KPFE-stock" / image["asset"]
+    return ROOT / "updater" / image.get("directory", "KPFE-stock") / image["asset"]
 
 
 def resolve_android_sdk(environ=None, workspace_root=None, home=None):

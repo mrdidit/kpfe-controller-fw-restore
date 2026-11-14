@@ -14,7 +14,7 @@ The **Elite v8 and v9 firmware images** were captured from stock updates,
 verified against the saved originals by SHA-256, and are bundled unchanged
 in the APK.
 
-[Download the APK](https://github.com/mrdidit/kpfe-controller-fw-restore/releases/tag/v0.4.2-preview).
+[Download the APK](https://github.com/mrdidit/kpfe-controller-fw-restore/releases/tag/v0.5.0-preview).
 Requires Android 12+ (API 31), ARM64, root, Android user 0 and stock AYANEO services.
 
 Select v8/v9 → **Check root & device** → confirm **Restore**. Keep the app visible
@@ -22,7 +22,15 @@ and power connected. Minimum battery: 15% while charging, 30% otherwise.
 The app enters update mode through UART, transfers the pinned image, sends Quit
 and cycles the display to reinitialize AYANEO controls. Android does not reboot.
 
-Diagnostics contains entry/exit tests, reinitialization and logs.
+Diagnostics contains entry/exit tests, reinitialization, logs and **Collect &
+export one support report**. The passive ZIP captures device/USB state and updater
+evidence without entering update mode or sending controller commands.
+
+**Standard Pocket FIT preview support:** separate AR14/USB path and bundled,
+hash-pinned supplied firmware (version unconfirmed). Device and image checks
+reject cross-model flashing. FIT restoration is **not hardware-tested**; use the
+single support report to investigate a failed AYANEO update. Report collection
+and export were tested on KPFE in 0.5.0; no firmware was written during that test.
 
 **Hardware validation on a working Elite:**
 

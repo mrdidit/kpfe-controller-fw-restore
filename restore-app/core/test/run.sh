@@ -18,3 +18,7 @@ java -cp "$build_dir/classes" org.kpfe.restore.core.CoreTests \
 java -cp "$build_dir/classes" org.kpfe.restore.core.DualImageTests \
   "$workspace_dir/updater/KPFE-stock/KPFE_KR02_v8.bin" \
   "$workspace_dir/updater/KPFE-stock/KPFE_KR02_v9.bin"
+java -cp "$build_dir/classes" org.kpfe.restore.core.FitUsbTests \
+  "$workspace_dir/updater/Pocket-FIT/Pocket_FIT_supplied.bin" \
+  "$workspace_dir/updater/KPFE-stock/KPFE_KR02_v8.bin" \
+  "$workspace_dir/updater/KPFE-stock/KPFE_KR02_v9.bin"

@@ -20,7 +20,13 @@ public final class SerialPort {
     public static void loadVerifiedLibrary(String absolutePath) { System.load(absolutePath); }
 
     public SerialPort() throws IOException {
-        mFd = open("/dev/ttyHS1", 115200, 1, 8, 0, 0, 0);
+        this("/dev/ttyHS1");
+    }
+
+    public SerialPort(String path) throws IOException {
+        if (!"/dev/ttyHS1".equals(path) && !"/dev/ttyHS5".equals(path))
+            throw new IOException("Unsupported controller UART");
+        mFd = open(path, 115200, 1, 8, 0, 0, 0);
         if (mFd == null) throw new IOException("Stock native UART open returned null");
         input = new FileInputStream(mFd);
         output = new FileOutputStream(mFd);

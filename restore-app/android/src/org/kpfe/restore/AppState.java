@@ -5,7 +5,7 @@ import android.content.SharedPreferences;
 
 /** Process-wide observable state; the service owns the work, never the activity. */
 final class AppState {
-    static boolean initialized, busy, ready, holdScreenForRecovery;
+    static boolean initialized, busy, ready, holdScreenForRecovery, collectingReport;
     static String mode = "", status = "IDLE", title = "Ready when you are", message = "Check this device and grant root access to begin.";
     static int packet, total;
     static int selectedFirmwareVersion = 8, checkedFirmwareVersion;
@@ -20,14 +20,15 @@ final class AppState {
         initialized = true;
         SharedPreferences p = context.getSharedPreferences("restore", 0);
         int savedTarget = p.getInt("selectedFirmwareVersion", 8);
-        selectedFirmwareVersion = savedTarget == 9 ? 9 : 8;
+        selectedFirmwareVersion = DeviceIdentity.hint() == DeviceProfile.FIT
+                ? FirmwareTarget.FIT_SUPPLIED : savedTarget == 9 ? 9 : 8;
         // A previous process's version observation is not a fresh device check.
         // The next root check populates the actual stock-reported version again.
         holdScreenForRecovery = p.getBoolean("holdScreenForRecovery", false);
-        if (p.getInt("uiVersionCode", 0) != 6 && !p.getBoolean("busy", false) && !holdScreenForRecovery) {
+        if (p.getInt("uiVersionCode", 0) != 7 && !p.getBoolean("busy", false) && !holdScreenForRecovery) {
             // Keep the full prior diagnostics, but do not present an old build's
             // result or obsolete instructions as this build's current action.
-            p.edit().putInt("uiVersionCode", 6).putString("status", "IDLE")
+            p.edit().putInt("uiVersionCode", 7).putString("status", "IDLE")
                     .putString("title", "Ready when you are")
                     .putString("message", "Choose a stock firmware version, then check this device to begin.").commit();
         }
@@ -45,7 +46,7 @@ final class AppState {
 
     static synchronized void persist(Context c) {
         c.getSharedPreferences("restore", 0).edit().putBoolean("busy", busy)
-            .putInt("uiVersionCode", 6)
+            .putInt("uiVersionCode", 7)
             .putInt("selectedFirmwareVersion", selectedFirmwareVersion)
             .putBoolean("holdScreenForRecovery", holdScreenForRecovery)
             .putString("status", status).putString("title", title).putString("message", message)
