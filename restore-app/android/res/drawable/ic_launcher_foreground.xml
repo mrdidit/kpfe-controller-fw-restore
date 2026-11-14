@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Authored KPFE lettering, kept inside the adaptive icon's central safe area. -->
+    <path android:fillColor="#EAF9F1" android:pathData="M30,31 L33,31 L33,37 L38,31 L42,31 L36,38 L42,45 L38,45 L33,39 L33,45 L30,45 Z M44,31 L51,31 Q56,31 56,36 Q56,41 51,41 L47,41 L47,45 L44,45 Z M47,34 L47,38 L51,38 Q53,38 53,36 Q53,34 51,34 Z" android:fillType="evenOdd" />
+    <path android:fillColor="#EAF9F1" android:pathData="M58,31 L68,31 L68,34 L61,34 L61,37 L67,37 L67,40 L61,40 L61,45 L58,45 Z M70,31 L80,31 L80,34 L73,34 L73,37 L79,37 L79,40 L73,40 L73,42 L80,42 L80,45 L70,45 Z" />
+    <path android:fillColor="#A8EDCA" android:pathData="M37,51 L71,51 Q76,51 77.5,57 L81,71 Q82,77 77,77 Q74,77 69,71 L39,71 Q34,77 31,77 Q26,77 27,71 L30.5,57 Q32,51 37,51 Z" />
+    <path android:fillColor="#132C24" android:pathData="M37,56 L41,56 L41,60 L45,60 L45,64 L41,64 L41,68 L37,68 L37,64 L33,64 L33,60 L37,60 Z M68,55.5 A2.5,2.5 0,1 0,68 60.5 A2.5,2.5 0,1 0,68 55.5 M74,61.5 A2.5,2.5 0,1 0,74 66.5 A2.5,2.5 0,1 0,74 61.5 M51,64 A3,3 0,1 0,51 70 A3,3 0,1 0,51 64 M59,64 A3,3 0,1 0,59 70 A3,3 0,1 0,59 64" />
+</vector>
