@@ -25,10 +25,10 @@ final class AppState {
         // A previous process's version observation is not a fresh device check.
         // The next root check populates the actual stock-reported version again.
         holdScreenForRecovery = p.getBoolean("holdScreenForRecovery", false);
-        if (p.getInt("uiVersionCode", 0) != 7 && !p.getBoolean("busy", false) && !holdScreenForRecovery) {
+        if (p.getInt("uiVersionCode", 0) != 8 && !p.getBoolean("busy", false) && !holdScreenForRecovery) {
             // Keep the full prior diagnostics, but do not present an old build's
             // result or obsolete instructions as this build's current action.
-            p.edit().putInt("uiVersionCode", 7).putString("status", "IDLE")
+            p.edit().putInt("uiVersionCode", 8).putString("status", "IDLE")
                     .putString("title", "Ready when you are")
                     .putString("message", "Choose a stock firmware version, then check this device to begin.").commit();
         }
@@ -46,7 +46,7 @@ final class AppState {
 
     static synchronized void persist(Context c) {
         c.getSharedPreferences("restore", 0).edit().putBoolean("busy", busy)
-            .putInt("uiVersionCode", 7)
+            .putInt("uiVersionCode", 8)
             .putInt("selectedFirmwareVersion", selectedFirmwareVersion)
             .putBoolean("holdScreenForRecovery", holdScreenForRecovery)
             .putString("status", status).putString("title", title).putString("message", message)

@@ -72,21 +72,10 @@ final class FitUsbAccess implements FitUsbEngine.Transport {
                 : (application.isEmpty() && boot.isEmpty() ? "not-enumerated" : "unknown-or-ambiguous")); }
     }
 
-    @SuppressWarnings("deprecation")
     FitUsbAccess(FitFirmwareImage selected) throws IOException {
         image = selected.copyBytes();
         try {
-            // Keep this bootstrap aligned with SupportReportRoot.frameworkUsbProbe.
-            // A thread-local Looper alone does not initialize Android's main Looper.
-            if (Looper.getMainLooper() == null) Looper.prepareMainLooper();
-            Class<?> threadClass = Class.forName("android.app.ActivityThread");
-            Method systemMain = threadClass.getDeclaredMethod("systemMain");
-            systemMain.setAccessible(true);
-            Object thread = systemMain.invoke(null);
-            Method getContext = threadClass.getDeclaredMethod("getSystemContext");
-            getContext.setAccessible(true);
-            Context context = (Context) getContext.invoke(thread);
-            if (context == null) throw new IOException("Android system context is unavailable.");
+            Context context = RootUsbContext.create();
             manager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
             if (manager == null) throw new IOException("Android USB service is unavailable.");
             // Resolve this before an entry command. Calling it is restore-only,
@@ -96,7 +85,7 @@ final class FitUsbAccess implements FitUsbEngine.Transport {
             throw new IOException("Root Android USB initialization failed before entry: " + FitRootMain.explain(error), error);
         }
         FitRootMain.emit("usb-service-ready", "mainLooperPrepared", Looper.getMainLooper() != null,
-                "systemContextCreated", true, "grantPermissionMethodResolved", true,
+                "systemContextCreated", true, "systemThread", false, "grantPermissionMethodResolved", true,
                 "usbOpened", false, "permissionChanged", false);
     }
 

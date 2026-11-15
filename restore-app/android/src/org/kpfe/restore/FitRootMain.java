@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** Separate standard Pocket FIT root entry. No arbitrary image, USB target, or UART commands. */
 public final class FitRootMain {
     private static final String PACKAGE = "org.kpfe.restore", GAMEWINDOW = "com.ayaneo.gamewindow";
+    private static final String VENDOR_UPDATER = "com.ayaneo.newcontrollerota";
     private static final String UART = "/dev/ttyHS5";
     private static final String PAUSE = "AYA_CONTROLLER_UPDATE_RIGHT_NOW", FINISH = "AYA_CONTROLLER_UPDATE_FINISH";
     private static final String NATIVE_SHA256 = "0a939a29544a76913ad682a57cd572246cc23c57cdff4db5040282f90532e3e6";
@@ -39,6 +40,12 @@ public final class FitRootMain {
     private static final CountDownLatch CONTROL_READY = new CountDownLatch(1);
     private static volatile boolean controlStateChanged;
     private static volatile FitUsbAccess activeUsb;
+    private static volatile String activeMode = "";
+    private static volatile EntrySession activeEntry;
+    private static volatile boolean probeLoaderObserved;
+    private static volatile boolean probeLoaderValidated, probeLoaderInitiallyPresent;
+    private static volatile boolean probeUsbStateUncertain;
+    private static int commandDiagnosticBytes;
 
     private FitRootMain() { }
 
@@ -47,20 +54,30 @@ public final class FitRootMain {
         try { exit = execute(args); }
         catch (Throwable error) {
             boolean flash = activeUsb != null && activeUsb.flashMayHaveStarted;
-            emit("result", "status", flash || controlStateChanged ? "INDETERMINATE" : (CANCELLED.get() ? "CANCELLED" : "FAILED"),
-                    "message", explain(error), "flashMayHaveStarted", flash, "controlStateChanged", controlStateChanged,
-                    "inputFunctionVerified", false, "androidRebootPerformed", false);
+            if ("fit-entry-probe".equals(activeMode)) {
+                boolean hold = probeHoldRequired(activeEntry, probeLoaderObserved);
+                String status = hold ? "INDETERMINATE" : (CANCELLED.get() || error instanceof InterruptedException ? "CANCELLED" : "FAILED");
+                emitProbeResult(status,
+                        explain(error), activeEntry, probeLoaderValidated, probeLoaderInitiallyPresent, hold, "");
+                if (handledProbeFailure(error) && safeProbeTerminal(status, activeEntry, probeLoaderValidated, hold, "")) exit = 0;
+            } else {
+                emit("result", "status", flash || controlStateChanged ? "INDETERMINATE" : (CANCELLED.get() ? "CANCELLED" : "FAILED"),
+                        "message", explain(error), "flashMayHaveStarted", flash, "controlStateChanged", controlStateChanged,
+                        "inputFunctionVerified", false, "androidRebootPerformed", false);
+            }
         }
         System.out.flush();
         System.exit(exit);
     }
 
     private static int execute(String[] args) throws Exception {
-        if (args.length != 3 || !("check".equals(args[0]) || "restore".equals(args[0])))
-            throw new IOException("Usage: FitRootMain check|restore <private pinned FIT image> <installed native library>");
+        if (args.length > 0) activeMode = args[0];
+        if (args.length != 3 || !("check".equals(args[0]) || "restore".equals(args[0]) || "fit-entry-probe".equals(args[0])))
+            throw new IOException("Usage: FitRootMain check|restore|fit-entry-probe <private pinned FIT image> <installed native library>");
         if (Os.getuid() != 0) throw new IOException("Root permission is required (UID 0).");
         DeviceIdentity.Snapshot identity = DeviceIdentity.read();
         if (identity.profile != DeviceProfile.FIT) throw new IOException("Standard Pocket FIT identity is required: " + identity.description());
+        if ("fit-entry-probe".equals(activeMode)) requireVendorUpdaterStopped();
         Command user = command(5000, "/system/bin/am", "get-current-user");
         user.requireSuccess("Read foreground Android user");
         if (!"0".equals(user.output.trim())) throw new IOException("Only Android user 0 is supported.");
@@ -90,13 +107,22 @@ public final class FitRootMain {
             verifyAndLoadLibrary(args[2]);
             FitUsbAccess usb = new FitUsbAccess(image);
             activeUsb = usb;
-            FitUsbAccess.Snapshot initial = usb.snapshot(true);
+            FitUsbAccess.Snapshot initial = "fit-entry-probe".equals(activeMode) ? probeSnapshot(usb, true) : usb.snapshot(true);
             FitUsbAccess.Device initialDevice;
             EntrySession entry = null;
-            if (!initial.boot.isEmpty()) initialDevice = initial.requireBootloader();
+            if (!initial.boot.isEmpty()) {
+                // Even a failed/cancelled probe must not clear a known loader hold.
+                if ("fit-entry-probe".equals(activeMode)) probeLoaderObserved = true;
+                initialDevice = initial.requireBootloader();
+                if ("fit-entry-probe".equals(activeMode)) {
+                    probeLoaderValidated = true;
+                    probeLoaderInitiallyPresent = true;
+                }
+            }
             else {
                 initialDevice = initial.application.isEmpty() ? null : initial.requireApplication();
                 entry = new EntrySession();
+                activeEntry = entry;
                 entry.preflight(); // Metadata only; UART is not opened and no broadcast is sent.
             }
             if ("check".equals(args[0])) {
@@ -108,9 +134,140 @@ public final class FitRootMain {
                 return 0;
             }
             startControlReader();
-            if (!CONTROL_READY.await(5, TimeUnit.SECONDS)) throw new IOException("App control pipe did not send START; no restore began.");
+            if (!CONTROL_READY.await(5, TimeUnit.SECONDS)) throw new IOException("App control pipe did not send START; no controller command was sent.");
             checkCancelled();
+            if ("fit-entry-probe".equals(args[0])) return probeEntry(usb, initialDevice, entry);
             return restore(usb, image, initialDevice, entry);
+        }
+    }
+
+    /** Observe stock software entry only. Deliberately has no USB open, transfer, or Quit path. */
+    private static int probeEntry(FitUsbAccess usb, FitUsbAccess.Device initial, EntrySession entry) {
+        String status = "FAILED", message = "FIT update-entry probe did not start.", cleanupError = "";
+        boolean handledFailure = false, interruptedFailure = false;
+        try {
+            emit("progress", "phase", "ENTERING_BOOTLOADER", "message", "Testing stock FIT entry without firmware data or Quit.",
+                    "packetIndex", 0, "packetCount", 0);
+            sleepChecked(3000); // Same stock initial delay as restore, including an existing loader.
+            requireVendorUpdaterStopped();
+            FitUsbAccess.Snapshot now = probeSnapshot(usb, true);
+            if (now.boot.isEmpty()) {
+                if (entry == null) throw new IOException("Previously detected bootloader disappeared; no fallback entry command will be sent.");
+                if (!now.application.isEmpty()) {
+                    FitUsbAccess.Device application = now.requireApplication();
+                    if (initial != null) FitUsbAccess.requireSamePhysicalPort(initial, application);
+                    else initial = application;
+                } else emit("usb-application-absent", "stockUartEntryAvailable", true,
+                        "message", "No normal USB controller enumerated. The probe sends only the stock HS5 entry command and observes USB; no firmware data will be sent.");
+                entry.sendEntryOnce();
+            } else probeLoaderObserved = true;
+            sleepChecked(3000); // Same stock settling delay before USB discovery.
+            awaitBootloader(usb, initial);
+            probeLoaderObserved = true;
+            probeLoaderValidated = true;
+            requireVendorUpdaterStopped();
+            checkCancelled();
+            boolean attempted = entry != null && entry.attempted;
+            status = attempted ? "FIT_ENTRY_CONFIRMED" : "FIT_BOOTLOADER_PRESENT";
+            message = attempted
+                    ? "The stock software-entry command was sent and a matching USB bootloader appeared."
+                    : "A matching USB bootloader was observed without sending an entry command; software entry was not tested.";
+        } catch (Exception error) {
+            handledFailure = handledProbeFailure(error);
+            interruptedFailure = error instanceof InterruptedException;
+            status = probeHoldRequired(entry, probeLoaderObserved) ? "INDETERMINATE" : (CANCELLED.get() ? "CANCELLED" : "FAILED");
+            message = explain(error) + " No controller command will be retried.";
+        } finally {
+            boolean interrupted = Thread.interrupted();
+            List<String> failures = new ArrayList<>();
+            if (entry != null) {
+                try { entry.closeOwnedUart(); } catch (Exception error) { failures.add(explain(error)); }
+                if (entry.paused) {
+                    boolean normalUsbObserved = false;
+                    FitUsbAccess.Device normalDevice = null;
+                    if (!entry.attempted && !probeLoaderObserved && entry.closedVerified && !CHILD_STILL_RUNNING.get()) {
+                        try {
+                            FitUsbAccess.Snapshot cleanup = probeSnapshot(usb, true);
+                            if (!cleanup.boot.isEmpty()) probeLoaderObserved = true;
+                            if (cleanup.boot.isEmpty() && cleanup.application.size() == 1) {
+                                FitUsbAccess.Device application = cleanup.requireApplication();
+                                if (initial != null) FitUsbAccess.requireSamePhysicalPort(initial, application);
+                                normalDevice = application;
+                                normalUsbObserved = true;
+                            }
+                        } catch (Exception error) { failures.add("Could not verify unchanged application USB mode: " + explain(error)); }
+                    }
+                    if (FitProbePolicy.mayResume(entry.attempted, probeLoaderObserved || probeUsbStateUncertain, normalUsbObserved,
+                            entry.closedVerified, !CHILD_STILL_RUNNING.get())) {
+                        try { entry.resume(normalDevice); } catch (Exception error) { failures.add(explain(error)); }
+                    } else emit("probe-handoff-withheld", "entryAttempted", entry.attempted,
+                            "bootloaderObserved", probeLoaderObserved, "normalUsbObserved", normalUsbObserved,
+                            "uartClosedVerified", entry.closedVerified,
+                            "message", "GameWindow FINISH withheld: the probe does not exit or reinitialize a changed/unknown controller.");
+                }
+            }
+            cleanupError = RootPolicy.boundedDiagnostic(String.join("; ", failures));
+            if (!cleanupError.isEmpty()) { status = "INDETERMINATE"; message += "; cleanup: " + cleanupError; }
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+        boolean hold = probeHoldRequired(entry, probeLoaderObserved);
+        if (handledFailure && !hold && cleanupError.isEmpty()) status = interruptedFailure ? "CANCELLED" : "FAILED";
+        if (CANCELLED.get() || Thread.currentThread().isInterrupted()) {
+            status = hold ? "INDETERMINATE" : "CANCELLED";
+            message += " App control was cancelled before completion.";
+        }
+        if (hold) message += " Controller mode is held or uncertain. No exit was sent. Keep power connected; restoring firmware requires a separate confirmation.";
+        else message += " No update-entry command was sent and any GameWindow pause was handed back.";
+        emitProbeResult(status, message, entry, probeLoaderValidated, probeLoaderInitiallyPresent, hold, cleanupError);
+        return "FIT_ENTRY_CONFIRMED".equals(status) || "FIT_BOOTLOADER_PRESENT".equals(status)
+                || (handledFailure && safeProbeTerminal(status, entry, probeLoaderValidated, hold, cleanupError)) ? 0 : 1;
+    }
+
+    private static boolean handledProbeFailure(Throwable error) {
+        return error instanceof IOException || error instanceof InterruptedException || error instanceof ErrnoException;
+    }
+
+    private static boolean safeProbeTerminal(String status, EntrySession entry, boolean loaderValidated,
+                                             boolean hold, String cleanupError) {
+        if (hold || !("FAILED".equals(status) || "CANCELLED".equals(status))) return false;
+        boolean attempted = controlStateChanged || (entry != null && entry.attempted);
+        return FitProbePolicy.structurallyValid(new FitProbePolicy.Result(status, true, attempted,
+                attempted && loaderValidated, loaderValidated, controlStateChanged, hold,
+                false, false, false, false, entry == null || entry.closedVerified,
+                !CHILD_STILL_RUNNING.get(), cleanupError));
+    }
+
+    private static boolean probeHoldRequired(EntrySession entry, boolean loaderObserved) {
+        return probeUsbStateUncertain || FitProbePolicy.recoveryHoldRequired(controlStateChanged || (entry != null && entry.attempted), loaderObserved,
+                entry != null && entry.paused, entry != null && entry.resumed, entry == null || entry.closedVerified,
+                !CHILD_STILL_RUNNING.get());
+    }
+
+    private static void emitProbeResult(String status, String message, EntrySession entry, boolean loaderValidated,
+                                        boolean loaderInitiallyPresent, boolean hold, String cleanupError) {
+        boolean attempted = controlStateChanged || (entry != null && entry.attempted);
+        emit("result", "status", status, "message", RootPolicy.boundedDiagnostic(message), "mode", "fit-entry-probe", "profile", "FIT",
+                "softwareEntryAttempted", attempted, "softwareEntryConfirmed", attempted && loaderValidated,
+                "bootloaderObserved", loaderValidated, "bootloaderCandidateObserved", probeLoaderObserved,
+                "bootloaderInitiallyPresent", loaderInitiallyPresent, "recoveryHoldRequested", hold,
+                "usbObservationComplete", !probeUsbStateUncertain,
+                "firmwareDataSent", false, "packetsSent", 0, "packetsAcknowledged", 0, "quitSent", false,
+                "usbOpened", false, "flashMayHaveStarted", false, "controlStateChanged", controlStateChanged,
+                "uartClosedVerified", entry == null || entry.closedVerified, "gameWindowPaused", entry != null && entry.paused,
+                "gameWindowResumed", entry != null && entry.resumed, "subprocessesStopped", !CHILD_STILL_RUNNING.get(),
+                "cleanupError", cleanupError,
+                "inputFunctionVerified", false, "displayReinitialized", false, "androidRebootPerformed", false,
+                "versionComparisonApplicable", false, "targetVersion", "unconfirmed");
+    }
+
+    private static FitUsbAccess.Snapshot probeSnapshot(FitUsbAccess usb, boolean log) throws IOException {
+        try { return usb.snapshot(log); }
+        catch (IOException error) {
+            // Enumeration may have found ambiguous candidates before throwing.
+            // Do not turn an unavailable snapshot into evidence that a loader is absent.
+            probeUsbStateUncertain = true;
+            emit("probe-usb-observation-failed", "message", explain(error), "transportOpened", false);
+            throw error;
         }
     }
 
@@ -195,12 +352,15 @@ public final class FitRootMain {
     private static FitUsbAccess.Device awaitBootloader(FitUsbAccess usb, FitUsbAccess.Device before) throws IOException, InterruptedException {
         for (int attempt = 0; attempt <= 20; attempt++) {
             checkCancelled();
-            FitUsbAccess.Snapshot snapshot = usb.snapshot(attempt == 0 || attempt == 20);
+            FitUsbAccess.Snapshot snapshot = "fit-entry-probe".equals(activeMode)
+                    ? probeSnapshot(usb, attempt == 0 || attempt == 20) : usb.snapshot(attempt == 0 || attempt == 20);
             if (!snapshot.boot.isEmpty()) {
+                if ("fit-entry-probe".equals(activeMode)) probeLoaderObserved = true;
                 FitUsbAccess.Device loader = snapshot.requireBootloader();
                 if (before != null) FitUsbAccess.requireSamePhysicalPort(before, loader);
                 else emit("usb-topology", "before", "", "after", loader.physicalPort, "matched", false,
                         "identityAttested", false, "message", "No initial USB identity was available to bind the transition. Strict FIT identity, unique loader and endpoint checks apply.");
+                if ("fit-entry-probe".equals(activeMode)) probeLoaderValidated = true;
                 emit("bootloader-usb-observed", "device", loader.usb.getDeviceName(), "physicalPort", loader.physicalPort);
                 return loader;
             }
@@ -253,13 +413,16 @@ public final class FitRootMain {
         }
 
         void waitForReceiver() throws IOException, InterruptedException {
-            long deadline = SystemClock.elapsedRealtime() + 5000;
+            long deadline = SystemClock.elapsedRealtime() + 15000;
             do {
                 if (!gameWindowProcesses().containsAll(pids)) throw new IOException("Original GameWindow process disappeared.");
-                Command dump = command(Math.min(3000, Math.max(1, deadline - SystemClock.elapsedRealtime())),
-                        "/system/bin/dumpsys", "activity", "broadcasts");
+                Command dump = command(Math.min(8000, Math.max(1, deadline - SystemClock.elapsedRealtime())),
+                        "/system/bin/dumpsys", "activity", "broadcasts", GAMEWINDOW);
                 RootPolicy.requireBroadcastDump(dump.exitCode, dump.output);
-                if (RootPolicy.hasFinishReceiver(dump.output, pids)) return;
+                boolean registered = RootPolicy.hasFinishReceiver(dump.output, pids);
+                emit("gamewindow-receiver-check", "originalPids", new JSONArray(pids), "receiverRegistered", registered,
+                        "outputComplete", true, "packageFiltered", true);
+                if (registered) return;
                 Thread.sleep(100);
             } while (SystemClock.elapsedRealtime() < deadline);
             throw new IOException("GameWindow's registered FINISH receiver was not observed; entry refused.");
@@ -268,14 +431,16 @@ public final class FitRootMain {
         void sendEntryOnce() throws IOException, InterruptedException, ErrnoException {
             if (attempted) throw new IOException("FIT entry cannot be retried.");
             checkCancelled(); requireOwners(); waitForReceiver();
+            if ("fit-entry-probe".equals(activeMode)) requireVendorUpdaterStopped();
             paused = true;
             broadcast(PAUSE);
             checkCancelled(); requireOwners();
+            if ("fit-entry-probe".equals(activeMode)) requireVendorUpdaterStopped();
             long senderStart = SystemClock.elapsedRealtime();
             emit("native-open-attempt", "path", UART, "baud", 115200, "stopBits", 1, "dataBits", 8,
                     "parity", 0, "flowControl", 0, "flagsArgument", 0);
-            port = new SerialPort(UART);
             closedVerified = false;
+            port = new SerialPort(UART);
             StructStat opened = Os.fstat(port.descriptor());
             if (!OsConstants.S_ISCHR(opened.st_mode) || opened.st_rdev != uartDevice) throw new IOException("Opened FIT UART identity mismatch.");
             emit("native-open-result", "opened", true, "path", UART, "blockingNativeIo", true,
@@ -321,9 +486,23 @@ public final class FitRootMain {
         }
 
         void resume() throws IOException, InterruptedException {
+            resume(null);
+        }
+
+        void resume(FitUsbAccess.Device probeNormalDevice) throws IOException, InterruptedException {
             if (resumed || !paused) return;
             if (!closedVerified) throw new IOException("FIT UART closure is uncertain; handoff withheld.");
-            requireOwners(); waitForReceiver(); broadcast(FINISH);
+            requireOwners(); waitForReceiver();
+            if ("fit-entry-probe".equals(activeMode)) {
+                if (probeNormalDevice == null || attempted || probeLoaderObserved || probeUsbStateUncertain)
+                    throw new IOException("Probe has no unchanged normal-mode proof; FINISH withheld.");
+                requireVendorUpdaterStopped();
+                FitUsbAccess.Snapshot latest = probeSnapshot(activeUsb, true);
+                if (!latest.boot.isEmpty()) probeLoaderObserved = true;
+                FitUsbAccess.Device normal = latest.requireApplication();
+                FitUsbAccess.requireSamePhysicalPort(probeNormalDevice, normal);
+            }
+            broadcast(FINISH);
             long deadline = SystemClock.elapsedRealtime() + 5000;
             do {
                 requireOwners();
@@ -510,6 +689,33 @@ public final class FitRootMain {
         return found;
     }
 
+    /** Probe-only exclusion: an updater may retry even while it momentarily owns no UART/USB FD. */
+    private static void requireVendorUpdaterStopped() throws IOException {
+        File[] processes = new File("/proc").listFiles();
+        if (processes == null) throw new IOException("Cannot verify that the AYANEO updater is closed; entry probe refused.");
+        long deadline = SystemClock.elapsedRealtime() + 2500;
+        int visited = 0;
+        for (File process : processes) {
+            if (!process.getName().matches("[0-9]+")) continue;
+            if (++visited > 4096 || SystemClock.elapsedRealtime() >= deadline)
+                throw new IOException("AYANEO updater process check exceeded its bound; entry probe refused.");
+            final byte[] commandLine;
+            try { commandLine = readBounded(new File(process, "cmdline"), 16384); }
+            catch (IOException error) {
+                if (!process.exists()) continue; // Process exited during this read-only snapshot.
+                throw new IOException("Cannot inspect process " + process.getName() + " to exclude the AYANEO updater; entry probe refused.", error);
+            }
+            int end = 0;
+            while (end < commandLine.length && commandLine[end] != 0) end++;
+            String name = new String(commandLine, 0, end, StandardCharsets.UTF_8);
+            if (name.equals(VENDOR_UPDATER) || name.startsWith(VENDOR_UPDATER + ":"))
+                throw new IOException("Close the AYANEO service updater before testing entry; " + name
+                        + " is still running (pid " + process.getName() + "). No updater process will be stopped automatically.");
+        }
+        emit("probe-updater-process-check", "package", VENDOR_UPDATER, "activeProcessObserved", false,
+                "scanComplete", true, "processesVisited", visited, "snapshotAtomic", false);
+    }
+
     private static String processName(File process) {
         try {
             byte[] data = readBounded(new File(process, "cmdline"), 16384);
@@ -545,7 +751,15 @@ public final class FitRootMain {
     }
 
     private static Command command(long timeoutMillis, String... args) throws IOException, InterruptedException {
-        Process process = new ProcessBuilder(Arrays.asList(args)).redirectErrorStream(true).start();
+        long started = SystemClock.elapsedRealtime();
+        Process process;
+        try { process = new ProcessBuilder(Arrays.asList(args)).redirectErrorStream(true).start(); }
+        catch (IOException error) {
+            emit("command-result", "argv", new JSONArray(Arrays.asList(args)), "startedElapsedMillis", started,
+                    "elapsedMillis", SystemClock.elapsedRealtime() - started, "timeoutMillis", timeoutMillis,
+                    "started", false, "outputComplete", false, "message", explain(error));
+            throw error;
+        }
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         AtomicBoolean truncated = new AtomicBoolean();
         AtomicBoolean readError = new AtomicBoolean();
@@ -555,8 +769,9 @@ public final class FitRootMain {
                 int count;
                 while ((count = stream.read(block)) != -1) {
                     synchronized (output) {
-                        if (output.size() + count <= 2 * 1024 * 1024) output.write(block, 0, count);
-                        else truncated.set(true);
+                        int keep = Math.min(count, Math.max(0, 2 * 1024 * 1024 - output.size()));
+                        output.write(block, 0, keep);
+                        if (keep < count) truncated.set(true);
                     }
                 }
             } catch (IOException error) { readError.set(true); }
@@ -564,18 +779,27 @@ public final class FitRootMain {
         reader.setDaemon(true);
         reader.start();
         long deadline = SystemClock.elapsedRealtime() + timeoutMillis;
+        boolean timedOut = false, completed = false;
+        Integer observedExit = null;
         try {
             int exit;
             while (true) {
-                try { exit = process.exitValue(); break; }
+                try { exit = process.exitValue(); observedExit = exit; break; }
                 catch (IllegalThreadStateException running) {
-                    if (SystemClock.elapsedRealtime() >= deadline) throw new IOException("Command timed out: " + args[0] + " " + args[1]);
+                    if (SystemClock.elapsedRealtime() >= deadline) {
+                        timedOut = true;
+                        throw new IOException("Command timed out after " + timeoutMillis + " ms: " + String.join(" ", args));
+                    }
                     Thread.sleep(25);
                 }
             }
             reader.join(1000);
-            if (reader.isAlive() || readError.get() || truncated.get()) throw new IOException("Could not capture complete command output: " + args[0]);
-            return new Command(exit, new String(output.toByteArray(), StandardCharsets.UTF_8));
+            if (reader.isAlive() || readError.get() || truncated.get())
+                throw new IOException("Could not capture complete command output: " + String.join(" ", args));
+            byte[] captured;
+            synchronized (output) { captured = output.toByteArray(); }
+            completed = true;
+            return new Command(exit, new String(captured, StandardCharsets.UTF_8));
         } finally {
             process.destroy();
             try { process.getOutputStream().close(); } catch (IOException ignored) { }
@@ -590,8 +814,43 @@ public final class FitRootMain {
                 process.destroyForcibly();
                 CHILD_STILL_RUNNING.set(true);
             } finally {
+                try { reader.join(100); } catch (InterruptedException error) { interrupted = true; }
+                boolean receiverQuery = args.length >= 3 && "/system/bin/dumpsys".equals(args[0])
+                        && "activity".equals(args[1]) && "broadcasts".equals(args[2]);
+                if (receiverQuery || !completed || observedExit == null || observedExit != 0) {
+                    byte[] captured;
+                    synchronized (output) { captured = output.toByteArray(); }
+                    emitCommandDiagnostic(args, started, timeoutMillis, observedExit, timedOut, completed,
+                            truncated.get(), readError.get(), reader.isAlive(), captured);
+                }
                 if (interrupted) Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    /** Retain failed metadata inspection evidence; incomplete output is never passed to a guard. */
+    private static void emitCommandDiagnostic(String[] args, long started, long timeout, Integer exit,
+                                               boolean timedOut, boolean completed, boolean truncated,
+                                               boolean readError, boolean readerPending, byte[] captured) {
+        boolean complete = completed && !timedOut && !truncated && !readError && !readerPending;
+        int perCommandLimit = complete && exit != null && exit == 0 ? 4 * 1024 : 64 * 1024;
+        final int diagnosticBytes = Math.min(captured.length,
+                Math.min(perCommandLimit, Math.max(0, 256 * 1024 - commandDiagnosticBytes)));
+        commandDiagnosticBytes += diagnosticBytes;
+        emit("command-result", "argv", new JSONArray(Arrays.asList(args)), "startedElapsedMillis", started,
+                "elapsedMillis", SystemClock.elapsedRealtime() - started, "timeoutMillis", timeout,
+                "started", true, "exitObserved", exit != null, "exitCode", exit == null ? -1 : exit,
+                "timedOut", timedOut, "outputComplete", complete, "outputTruncated", truncated,
+                "readError", readError, "readerPending", readerPending, "subprocessCleanupUncertain", CHILD_STILL_RUNNING.get(),
+                "capturedBytes", captured.length, "diagnosticBytes", diagnosticBytes,
+                "diagnosticTruncated", captured.length > diagnosticBytes, "diagnosticPerCommandLimitBytes", perCommandLimit,
+                "diagnosticBudgetRemainingBytes", 256 * 1024 - commandDiagnosticBytes);
+        String diagnostic = new String(captured, 0, diagnosticBytes, StandardCharsets.UTF_8);
+        for (int offset = 0; offset < diagnostic.length(); offset += 512) {
+            int end = Math.min(diagnostic.length(), offset + 512);
+            emit("command-output", "startedElapsedMillis", started, "characterOffset", offset,
+                    "totalDiagnosticCharacters", diagnostic.length(), "outputComplete", complete,
+                    "text", diagnostic.substring(offset, end));
         }
     }
 

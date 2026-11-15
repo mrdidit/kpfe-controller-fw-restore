@@ -3,7 +3,7 @@ package org.kpfe.restore;
 /** Facts-only summary: absent/failed capture is never interpreted as a dead controller. */
 final class SupportFindings {
     static final class Facts {
-        String model = "unknown", vendorPids = "not captured", lastTrace = "not available", lastRestore = "not available";
+        String model = "unknown", vendorPids = "not captured", lastTrace = "not available", lastRestore = "not available", lastProbe = "not available";
         boolean standardFit, usbCaptured, rootConfirmed, rootComplete, rootTruncated;
         boolean rootUsbChecked, rootUsbReady, grantMethodResolved, vendorIdentityCaptured;
         int bootCandidates, appCandidates, vendorLogSections, usbSamples, usbOwnerSections;
@@ -51,6 +51,8 @@ final class SupportFindings {
             .append(". This is separate from the AYANEO updater's attempt and may be older.\n\n")
             .append("Latest restore from OUR app: ").append(facts.lastRestore)
             .append(". A later device check does not replace this restore evidence.\n\n")
+            .append("Latest FIT entry probe from OUR app: ").append(facts.lastProbe)
+            .append(". A later device check does not replace this probe evidence; command transmission alone does not confirm bootloader entry.\n\n")
             .append("Inspect root-capture.jsonl for updater errors, thread waits, USB ownership, root API failures and samples. ")
             .append("Use latest-session.log only when its app/version/time matches the incident. ")
             .append("A passive capture cannot recreate discarded historical logs or prove exactly where an earlier update stopped.\n")

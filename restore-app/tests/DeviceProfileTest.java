@@ -8,6 +8,11 @@ public final class DeviceProfileTest {
         expect(DeviceProfile.ELITE, "Pocket FIT Elite", "PocketFITElite", null, null);
         expect(DeviceProfile.ELITE, "Pocket FIT Elite", "PocketFITElite", "", "");
         expect(DeviceProfile.ELITE, "Pocket FIT Elite", "PocketFITElite", "generic", "generic");
+        // The S2 Pro report contains the same application USB ID as FIT; identity
+        // must still reject it, including when a partition contains a FIT label.
+        expect(DeviceProfile.UNSUPPORTED, "Pocket S2 Pro", "PocketS2Pro", "AYANEO_PocketS2_Pro", "AYANEO_PocketS2_Pro");
+        expect(DeviceProfile.UNSUPPORTED, "Pocket S2 Pro", "PocketS2Pro", "AYANEO_Pocket_FIT", "AYANEO_Pocket_FIT");
+        expect(DeviceProfile.UNSUPPORTED, "Pocket S2", "PocketS2", "AYANEO_PocketS2", "AYANEO_PocketS2");
         String[] models = {"Pocket FIT", "KONKR Pocket FIT"};
         String[] fitProducts = {"AYANEO_Pocket_FIT", "KONKR_Pocket_FIT"};
         String[] devices = {"PocketFIT", "vendor-board", "", null};

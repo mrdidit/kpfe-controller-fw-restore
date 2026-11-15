@@ -15,6 +15,7 @@ set -- "$app_dir"/core/src/org/kpfe/restore/core/*.java \
   "$app_dir/android/src/org/kpfe/restore/SessionTrace.java" \
   "$app_dir/android/src/org/kpfe/restore/DeviceProfile.java" \
   "$app_dir/android/src/org/kpfe/restore/FirmwareTarget.java" \
+  "$app_dir/android/src/org/kpfe/restore/FitProbePolicy.java" \
   "$app_dir/android/src/org/kpfe/restore/SupportArchive.java" \
   "$app_dir/android/src/org/kpfe/restore/SupportProcess.java" \
   "$app_dir/android/src/org/kpfe/restore/SupportFindings.java" \
@@ -36,6 +37,7 @@ java -cp "$build_dir/classes" org.kpfe.restore.FirmwareTargetTest \
   "$workspace_dir/updater/Pocket-FIT/Pocket_FIT_supplied.bin" \
   "$workspace_dir/updater/KPFE-stock/KPFE_KR02_v8.bin" \
   "$workspace_dir/updater/KPFE-stock/KPFE_KR02_v9.bin"
+java -cp "$build_dir/classes" org.kpfe.restore.FitProbePolicyTest
 java -cp "$build_dir/classes" org.kpfe.restore.SupportCaptureTest
 java -cp "$build_dir/classes" org.kpfe.restore.SupportFindingsTest
 python3 -m unittest discover -s "$test_dir" -p 'test_build_packaging.py' -v

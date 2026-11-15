@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "restore-app"
 BUILD = ROOT / ".build/restore-app"
 DIST = ROOT / "dist"
-VERSION = "0.5.0-preview"
-VERSION_CODE = 7
+VERSION = "0.5.2-preview"
+VERSION_CODE = 9
 NAME = "Controller-FW-Restore-" + VERSION + ".apk"
 FIRMWARE_IMAGES = (
     {"version": "8", "asset": "KPFE_KR02_v8.bin", "bytes": 58568,

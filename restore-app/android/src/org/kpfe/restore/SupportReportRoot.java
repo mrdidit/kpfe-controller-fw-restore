@@ -90,27 +90,16 @@ public final class SupportReportRoot {
     private void requireTime() throws IOException { if (remaining() <= 0) throw new IOException("Support collection deadline reached"); }
 
     /** Checks the root USB adapter's framework prerequisites without granting or opening anything. */
-    @SuppressWarnings("deprecation")
     private void frameworkUsbProbe() {
         JSONObject result = new JSONObject();
-        String stage = "prepare-main-looper";
+        String stage = "root-usb-client-context";
         try {
             requireTime();
             emit("usb-framework-root-start", new JSONObject().put("stage", stage));
-            if (Looper.getMainLooper() == null) Looper.prepareMainLooper();
+            Context context = RootUsbContext.create();
             result.put("mainLooperPrepared", Looper.getMainLooper() != null);
-            stage = "ActivityThread.systemMain";
-            Class<?> activityThread = Class.forName("android.app.ActivityThread");
-            java.lang.reflect.Method systemMain = activityThread.getDeclaredMethod("systemMain");
-            systemMain.setAccessible(true);
-            Object thread = systemMain.invoke(null);
-            stage = "ActivityThread.getSystemContext";
-            java.lang.reflect.Method getContext = activityThread.getDeclaredMethod("getSystemContext");
-            getContext.setAccessible(true);
-            Context context = (Context)getContext.invoke(thread);
             systemContext = context;
-            result.put("systemContextCreated", context != null);
-            if (context == null) throw new IOException("System context unavailable");
+            result.put("systemContextCreated", true).put("systemThread", false);
             stage = "USB-service-and-permission";
             try {
                 int permission = context.checkCallingOrSelfPermission("android.permission.MANAGE_USB");
@@ -140,7 +129,8 @@ public final class SupportReportRoot {
             }
             result.put("devices", devices).put("completed", true);
         } catch (Throwable e) {
-            try { result.put("completed", false).put("failedStage", stage).put("error", rootError(e)); }
+            try { result.put("completed", false).put("failedStage", stage).put("error", rootError(e))
+                    .put("errorStack", rootStack(e)); }
             catch (Exception ignored) { }
         }
         try { result.put("transportOpened", false).put("grantPermissionInvoked", false); } catch (Exception ignored) { }
@@ -616,5 +606,17 @@ public final class SupportReportRoot {
     private static String rootError(Throwable error) {
         for (int i = 0; i < 5 && error.getCause() != null && error.getCause() != error; i++) error = error.getCause();
         return scrub(error.getClass().getSimpleName() + ": " + error.getMessage());
+    }
+    private static JSONArray rootStack(Throwable error) {
+        JSONArray stack = new JSONArray();
+        for (int cause = 0; cause < 4 && error != null; cause++) {
+            stack.put(error.getClass().getName());
+            StackTraceElement[] frames = error.getStackTrace();
+            for (int i = 0; i < Math.min(frames.length, 16); i++) stack.put(scrub(frames[i].toString()));
+            Throwable next = error.getCause();
+            if (next == error) break;
+            error = next;
+        }
+        return stack;
     }
 }

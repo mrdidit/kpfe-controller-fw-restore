@@ -56,7 +56,7 @@ public final class SupportReport {
                 add(zip, "README.txt", "Passive support capture. No USB/tty transport was opened, no controller commands were sent, and no settings were changed.\n"
                         + "Missing data, root denial and time/output limits are recorded explicitly. USB metadata is a snapshot, not a controller identification guarantee.\n"
                         + "Android IMEI, device serial, USB serial strings and unrestricted package inventories are not requested.\n"
-                        + "The latest restore trace is retained even after a later check (up to16MiB); other capture output is bounded.\n", 8192);
+                        + "The latest restore and FIT entry-probe traces are retained even after a later check; capture output is bounded.\n", 8192);
                 capture(zip, outcomes, "app.json", () -> appInfo(app, deadline).toString(2));
                 capture(zip, outcomes, "device.json", () -> identity(app).toString(2));
                 capture(zip, outcomes, "usb-framework.json", () -> {
@@ -83,6 +83,9 @@ public final class SupportReport {
                     if (entry.optBoolean("captured") && ("latest-restore.log".equals(entry.optString("section"))
                             || ("latest-session.log".equals(entry.optString("section")) && entry.optString("sourceName").startsWith("session-restore-"))))
                         facts.lastRestore = entry.optString("section") + ": " + entry.optString("sourceName");
+                    if (entry.optBoolean("captured") && ("latest-fit-entry-probe.log".equals(entry.optString("section"))
+                            || ("latest-session.log".equals(entry.optString("section")) && entry.optString("sourceName").startsWith("session-fit-entry-probe-"))))
+                        facts.lastProbe = entry.optString("section") + ": " + entry.optString("sourceName");
                 }
                 try {
                     long remaining = Math.max(1, Math.min(42000, deadline - SystemClock.elapsedRealtime() - 2500));
@@ -243,21 +246,31 @@ public final class SupportReport {
         }
         File directory = new File(app.getFilesDir(), "session-traces").getCanonicalFile();
         File restore = null;
+        File probe = null;
         File[] candidates = directory.listFiles();
         if (candidates != null) for (File candidate : candidates) {
-            if (!candidate.getName().startsWith("session-restore-") || !candidate.getName().endsWith(".log")) continue;
+            boolean isRestore = candidate.getName().startsWith("session-restore-");
+            boolean isProbe = candidate.getName().startsWith("session-fit-entry-probe-");
+            if ((!isRestore && !isProbe) || !candidate.getName().endsWith(".log")) continue;
             try {
                 File canonical = candidate.getCanonicalFile();
                 if (!directory.equals(canonical.getParentFile()) || !canonical.isFile()) continue;
-                if (restore == null || canonical.lastModified() > restore.lastModified()) restore = canonical;
+                if (isRestore && (restore == null || canonical.lastModified() > restore.lastModified())) restore = canonical;
+                if (isProbe && (probe == null || canonical.lastModified() > probe.lastModified())) probe = canonical;
             } catch (IOException ignored) { }
         }
         boolean same = supplied != null && restore != null && supplied.getCanonicalFile().equals(restore);
+        boolean sameProbe = supplied != null && probe != null && supplied.getCanonicalFile().equals(probe);
+        int restoreLimit = probe == null ? SupportArchive.MAX_ENTRY : 14 * 1024 * 1024;
+        int latestLimit = sameProbe ? 2 * 1024 * 1024
+                : ((restore != null && !same) || (probe != null && !sameProbe)) ? 256 * 1024 : restoreLimit;
+        if (same) latestLimit = restoreLimit;
         // Reserve space for both root evidence and the archive summary. A later
         // check must not hide the preceding transfer, nor exhaust the total limit.
-        captureTrace(zip, outcomes, directory, supplied, "latest-session.log",
-                restore != null && !same ? 256 * 1024 : SupportArchive.MAX_ENTRY);
-        if (restore != null && !same) captureTrace(zip, outcomes, directory, restore, "latest-restore.log", SupportArchive.MAX_ENTRY);
+        captureTrace(zip, outcomes, directory, supplied, "latest-session.log", latestLimit);
+        if (restore != null && !same) captureTrace(zip, outcomes, directory, restore, "latest-restore.log", restoreLimit);
+        if (probe != null && !sameProbe)
+            captureTrace(zip, outcomes, directory, probe, "latest-fit-entry-probe.log", 2 * 1024 * 1024);
     }
 
     private static void captureTrace(SupportArchive zip, JSONArray outcomes, File directory, File supplied,

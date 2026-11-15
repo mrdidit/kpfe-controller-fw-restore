@@ -249,12 +249,15 @@ public final class MainActivity extends Activity {
             if (AppState.busy || AppState.collectingReport) return;
             try { FirmwareTarget.forSelection(profile, target); }
             catch (IllegalArgumentException invalid) { showError("This device or selected firmware is unsupported."); return; }
-            if (profile == DeviceProfile.FIT && !mode.equals("check") && !mode.equals("restore")) {
+            if (profile == DeviceProfile.FIT && !mode.equals("check") && !mode.equals("restore") && !mode.equals("fit-entry-probe")) {
                 showError("That action is available only for Elite controllers."); return;
             }
+            if (mode.equals("fit-entry-probe") && profile != DeviceProfile.FIT) {
+                showError("This entry diagnostic is available only for standard Pocket FIT."); return;
+            }
             if (AppState.holdScreenForRecovery && !mode.equals("check") && !mode.equals("restore")) {
-                new AlertDialog.Builder(this).setTitle("Firmware state unresolved")
-                    .setMessage("Exit and reinitialization are unavailable while a restore may be incomplete. Keep power connected and this app visible.")
+                new AlertDialog.Builder(this).setTitle("Controller state unresolved")
+                    .setMessage("Further entry tests, exit and reinitialization are unavailable while controller state is unresolved. Keep power connected and this app visible. A support report can still be collected.")
                     .setPositiveButton("Close", null).show();
                 return;
             }
@@ -300,7 +303,9 @@ public final class MainActivity extends Activity {
             }
             String description = AppState.message.length() > 1600 ? AppState.message.substring(0, 1600) + "… See diagnostics." : AppState.message;
             if (!AppState.busy && AppState.holdScreenForRecovery)
-                description += "\n\nFirmware may be incomplete. Keep power connected, this app visible and the screen on. Do not reboot or try an exit/reset while the recovery state is unresolved.";
+                description += profile == DeviceProfile.FIT
+                    ? "\n\nController mode remains unresolved or update mode is being held. Keep power connected and this app visible. Collect one support report. No further entry, exit or restart is automatic; restoring requires a fresh check and separate confirmation."
+                    : "\n\nFirmware may be incomplete. Keep power connected, this app visible and the screen on. Do not reboot or try an exit/reset while the recovery state is unresolved.";
             detail.setText(AppState.collectingReport ? "Collecting device, USB and controller state plus the complete latest session log. No controller commands are sent." : description);
             badge.setText(AppState.collectingReport ? "COLLECTING REPORT" : AppState.busy ? "IN PROGRESS" : AppState.ready ? "CHECKS PASSED"
                     : profile == DeviceProfile.FIT ? "ROOTED FIT ONLY" : profile == DeviceProfile.ELITE ? "ROOTED ELITE ONLY" : "UNSUPPORTED DEVICE");
@@ -323,7 +328,7 @@ public final class MainActivity extends Activity {
     private void showDiagnostics() {
         LinearLayout panel = column();
         panel.setPadding(dp(20), dp(12), dp(20), dp(16));
-        diagnosticEntry = button("Test update mode", ACCENT, BG);
+        diagnosticEntry = button(profile == DeviceProfile.FIT ? "Test FIT entry (no flash)" : "Test update mode", ACCENT, BG);
         diagnosticExit = button("Exit update mode", ACCENT, BG);
         diagnosticRecovery = button("Reinitialize AYANEO controls", ACCENT, BG);
         diagnosticEntry.setMinHeight(dp(48));
@@ -333,7 +338,8 @@ public final class MainActivity extends Activity {
         add(panel, diagnosticExit, 6);
         add(panel, diagnosticRecovery, 6);
         if (profile != DeviceProfile.ELITE) {
-            diagnosticEntry.setVisibility(View.GONE); diagnosticExit.setVisibility(View.GONE);
+            if (profile != DeviceProfile.FIT) diagnosticEntry.setVisibility(View.GONE);
+            diagnosticExit.setVisibility(View.GONE);
             diagnosticRecovery.setVisibility(View.GONE);
         }
         diagnosticHint = text("", 13, MUTED);
@@ -356,7 +362,7 @@ public final class MainActivity extends Activity {
             diagnosticRecovery = null; diagnosticHint = null;
             diagnosticReport = null; diagnosticLastReport = null;
         });
-        diagnosticEntry.setOnClickListener(v -> { menu.dismiss(); confirmDiagnosticAction("entry-test"); });
+        diagnosticEntry.setOnClickListener(v -> { menu.dismiss(); confirmDiagnosticAction(profile == DeviceProfile.FIT ? "fit-entry-probe" : "entry-test"); });
         diagnosticExit.setOnClickListener(v -> { menu.dismiss(); confirmDiagnosticAction("exit-only"); });
         diagnosticRecovery.setOnClickListener(v -> { menu.dismiss(); confirmDiagnosticAction("resume-only"); });
         logs.setOnClickListener(v -> { menu.dismiss(); showLog(); });
@@ -373,7 +379,8 @@ public final class MainActivity extends Activity {
                     && !AppState.holdScreenForRecovery && profile == DeviceProfile.ELITE;
             boolean checked = hasFreshTargetCheck();
             // An idle tap can explain a missing check; it must never silently do nothing.
-            diagnosticEntry.setEnabled(recoveryAllowed);
+            diagnosticEntry.setEnabled(!AppState.busy && !AppState.collectingReport && !AppState.holdScreenForRecovery
+                    && (profile == DeviceProfile.ELITE || profile == DeviceProfile.FIT));
             diagnosticExit.setEnabled(recoveryAllowed);
             diagnosticRecovery.setEnabled(recoveryAllowed);
             diagnosticReport.setEnabled(!AppState.busy && !AppState.collectingReport);
@@ -381,6 +388,9 @@ public final class MainActivity extends Activity {
             diagnosticLastReport.setEnabled(!AppState.busy && !AppState.collectingReport);
             diagnosticHint.setText(AppState.collectingReport ? "Collecting a single report. Controller actions are paused."
                     : AppState.busy ? "A controller session is running. Logs remain available. Collect the report after it finishes."
+                    : profile == DeviceProfile.FIT ? (AppState.holdScreenForRecovery
+                        ? "Entry testing is locked while controller state is unresolved. Collect and export one support report; it sends no controller commands."
+                        : "Test FIT entry sends the stock entry command once and checks for the USB bootloader. It does not flash or exit update mode. A fresh device check and separate confirmation are required.")
                     : profile != DeviceProfile.ELITE ? "One passive report includes device and USB state, firmware checks and the complete latest session log. No diagnostic flashing or button presses are needed."
                     : AppState.holdScreenForRecovery ? "Update-mode and reinitialization actions are unavailable while firmware state is unresolved."
                     : !checked ? "A fresh device check is needed. Tap Test or Exit to check first."
@@ -402,7 +412,7 @@ public final class MainActivity extends Activity {
             target = AppState.selectedFirmwareVersion;
             blockedReason = AppState.collectingReport ? "A support report is being collected. Wait for it to finish."
                     : AppState.busy ? "A controller session is running. Wait for it to finish."
-                    : AppState.holdScreenForRecovery ? "Firmware state is unresolved. Keep power connected and the app visible. Update-mode and reinitialization actions are unavailable."
+                    : AppState.holdScreenForRecovery ? "Controller state is unresolved. Keep power connected and the app visible. Further entry, exit and reinitialization actions are unavailable. Collect one support report."
                     : null;
             needsCheck = !mode.equals("resume-only") && !hasFreshTargetCheck();
         }
@@ -413,12 +423,16 @@ public final class MainActivity extends Activity {
         }
         if (needsCheck) {
             new AlertDialog.Builder(this).setTitle("Check device first")
-                .setMessage("Run a fresh check for the selected firmware, then choose Test or Exit again. Changing the selected firmware or waiting more than five minutes requires another check.\n\nCheck now only checks the device; the update-mode action still needs your separate confirmation.")
+                .setMessage("Run a fresh check for the selected firmware, then choose the diagnostic again. Changing the selected firmware or waiting more than five minutes requires another check.\n\nCheck now only checks the device; the update-mode action still needs your separate confirmation.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Check now", (d, w) -> begin("check", target)).show();
             return;
         }
-        if (mode.equals("entry-test")) {
+        if (mode.equals("fit-entry-probe")) {
+            new AlertDialog.Builder(this).setTitle("Test FIT software entry without flashing?")
+                .setMessage("This sends the stock update-entry command once and watches for the FIT USB bootloader. If the bootloader is already present, no entry command is sent.\n\nNo firmware data or exit command is sent. The controller may remain in update mode and its controls may stop responding. No restart or display cycle is performed.\n\nClose AYANEO's updater first. Keep power connected and this app visible. After the result, collect and export one support report. Any restore is a separate action with its own confirmation.")
+                .setNegativeButton("Cancel", null).setPositiveButton("Test entry only", (d, w) -> begin(mode, target)).show();
+        } else if (mode.equals("entry-test")) {
             new AlertDialog.Builder(this).setTitle("Test entry without flashing?")
                 .setMessage("Temporarily enter update mode, then return to the installed firmware after entry is confirmed. No firmware data will be sent.\n\nControls may pause during the test. After the controller restarts, the display turns off for five seconds and wakes to restore normal controls. Android is not rebooted.")
                 .setNegativeButton("Cancel", null).setPositiveButton("Test entry", (d, w) -> begin(mode, target)).show();
@@ -435,7 +449,7 @@ public final class MainActivity extends Activity {
 
     private void showLog() {
         final String log;
-        synchronized (AppState.class) { log = "Controller FW Restore 0.5.0-preview\n" + AppState.status + "\n" + AppState.message
+        synchronized (AppState.class) { log = "Controller FW Restore 0.5.1-preview\n" + AppState.status + "\n" + AppState.message
                 + "\n\nSelected target: " + (profile == DeviceProfile.FIT ? "supplied Pocket FIT firmware; version unconfirmed" : "v" + AppState.selectedFirmwareVersion)
                 + "\nInstalled firmware: " + installedVersionLabel()
                 + "\nVersion source: " + AppState.currentFirmwareVersionSource

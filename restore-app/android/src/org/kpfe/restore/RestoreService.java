@@ -37,6 +37,7 @@ public final class RestoreService extends Service {
     private SessionTrace sessionTrace;
     private boolean traceWarningReported;
     private boolean inheritedRecoveryHold;
+    private FitProbePolicy.Result probeResult;
     private final Object sessionLock = new Object();
 
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -57,13 +58,15 @@ public final class RestoreService extends Service {
             if (AppState.collectingReport) {
                 stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId); return START_NOT_STICKY;
             }
-            if (!"check".equals(mode) && !"restore".equals(mode) && !"entry-test".equals(mode) && !"exit-only".equals(mode) && !"resume-only".equals(mode)) {
+            if (!"check".equals(mode) && !"restore".equals(mode) && !"entry-test".equals(mode) && !"exit-only".equals(mode) && !"resume-only".equals(mode) && !"fit-entry-probe".equals(mode)) {
                 stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId); return START_NOT_STICKY;
             }
             try {
                 target = FirmwareTarget.forSelection(DeviceIdentity.hint(), targetVersion);
-                if (target.profile == DeviceProfile.FIT && !"check".equals(mode) && !"restore".equals(mode))
+                if (target.profile == DeviceProfile.FIT && !"check".equals(mode) && !"restore".equals(mode) && !"fit-entry-probe".equals(mode))
                     throw new IllegalArgumentException("Unsupported FIT action");
+                if ("fit-entry-probe".equals(mode) && target.profile != DeviceProfile.FIT)
+                    throw new IllegalArgumentException("FIT entry diagnostic requires standard FIT");
             }
             catch (IllegalArgumentException invalid) {
                 fail("FAILED", "This device or firmware selection is unsupported. FIT and Elite images cannot be mixed.");
@@ -76,8 +79,8 @@ public final class RestoreService extends Service {
                 stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId); return START_NOT_STICKY;
             }
             if (AppState.holdScreenForRecovery && !mode.equals("check") && !mode.equals("restore")) {
-                AppState.title = "Firmware state unresolved";
-                AppState.message = "Keep power connected, this app visible and the screen on. An exit or screen reset could leave incomplete firmware unable to start.";
+                AppState.title = "Controller state unresolved";
+                AppState.message = "Keep power connected and this app visible. Further entry tests, exit and reinitialization are unavailable while controller state is unresolved. Collect one support report.";
                 AppState.persist(this);
                 stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId); return START_NOT_STICKY;
             }
@@ -97,9 +100,9 @@ public final class RestoreService extends Service {
             inheritedRecoveryHold = AppState.holdScreenForRecovery;
             // Persist before starting a firmware-capable helper. An interrupted
             // restore must not let our own UI silently allow display sleep.
-            if (mode.equals("restore")) AppState.holdScreenForRecovery = true;
+            if (mode.equals("restore") || mode.equals("fit-entry-probe")) AppState.holdScreenForRecovery = true;
             AppState.packet = 0; AppState.total = 0;
-            AppState.title = mode.equals("restore") ? "Preparing restore" : mode.equals("entry-test") ? "Testing update-mode entry" : mode.equals("exit-only") ? "Exiting update mode" : mode.equals("resume-only") ? "Resuming AYANEO controls" : "Checking the controller";
+            AppState.title = mode.equals("restore") ? "Preparing restore" : mode.equals("fit-entry-probe") ? "Testing FIT entry without flashing" : mode.equals("entry-test") ? "Testing update-mode entry" : mode.equals("exit-only") ? "Exiting update mode" : mode.equals("resume-only") ? "Resuming AYANEO controls" : "Checking the controller";
             AppState.message = "Grant access when your root manager asks.";
             AppState.status = "RUNNING";
             AppState.log.setLength(0);
@@ -116,6 +119,7 @@ public final class RestoreService extends Service {
 
     private void run(String mode, FirmwareTarget target) {
         resultSeen = false;
+        probeResult = null;
         sessionTrace = null;
         traceWarningReported = false;
         lastNotificationText = "";
@@ -127,7 +131,7 @@ public final class RestoreService extends Service {
                 throw new IOException("Free at least 32 MB of internal storage for the restore diagnostics.");
             File traceFile = File.createTempFile("session-" + mode + "-", ".log", traceDirectory);
             sessionTrace = new SessionTrace(traceFile);
-            sessionTrace.append("Controller FW Restore 0.5.0-preview; mode=" + mode
+            sessionTrace.append("Controller FW Restore 0.5.1-preview; mode=" + mode
                     + "; targetVersion=" + target.version + "; trace=" + traceFile.getName());
             if (!sessionTrace.failure().isEmpty()) throw new IOException(sessionTrace.failure());
             AppState.append("Full session trace: " + traceFile.getAbsolutePath());
@@ -189,6 +193,17 @@ public final class RestoreService extends Service {
             if (!resultSeen) throw new IOException(mode.equals("check")
                 ? "Root access was not granted, timed out, or the helper could not start. See diagnostics and allow Controller FW Restore in your root manager."
                 : "The helper exited without a confirmed result. Do not assume restoration completed; check the controller and diagnostics.");
+            if (mode.equals("fit-entry-probe")) {
+                synchronized (AppState.class) {
+                    AppState.holdScreenForRecovery = FitProbePolicy.holdAfterResult(inheritedRecoveryHold, true, exit == 0, probeResult);
+                    if (exit != 0 || probeResult == null || !FitProbePolicy.structurallyValid(probeResult)) {
+                        AppState.ready = false;
+                        AppState.status = "INDETERMINATE";
+                        AppState.title = "FIT entry not confirmed";
+                        AppState.message += "\nThe entry diagnostic did not finish with a clean, verified result. Keep the app visible and collect one support report. No automatic retry or restore will start.";
+                    }
+                }
+            }
             if (exit != 0) {
                 synchronized (AppState.class) {
                     if (AppState.ready || AppState.status.equals("SUCCESS")) {
@@ -204,7 +219,7 @@ public final class RestoreService extends Service {
         } catch (Exception e) {
             AppState.append(e.toString());
             if (sessionTrace != null) sessionTrace.append(e.toString());
-            if (mode.equals("restore")) {
+            if (mode.equals("restore") || mode.equals("fit-entry-probe")) {
                 synchronized (AppState.class) {
                     AppState.holdScreenForRecovery = rootProcess == null ? inheritedRecoveryHold : true;
                 }
@@ -285,6 +300,31 @@ public final class RestoreService extends Service {
                 if (e.optString("event").equals("result")) {
                     resultSeen = true;
                     AppState.status = e.optString("status", "INDETERMINATE");
+                    if (mode.equals("fit-entry-probe")) {
+                        probeResult = parseProbeResult(e);
+                        AppState.ready = false;
+                        // A probe can leave update mode active. Never reuse the
+                        // restore success path or release the hold before exit.
+                        AppState.holdScreenForRecovery = true;
+                        if (!FitProbePolicy.structurallyValid(probeResult)) {
+                            AppState.status = "INDETERMINATE";
+                            AppState.title = "FIT entry not confirmed";
+                            AppState.message = "The diagnostic result was incomplete or inconsistent. Keep the app visible and collect one support report. No further action starts automatically.";
+                        } else if (AppState.status.equals("FIT_ENTRY_CONFIRMED")) {
+                            AppState.title = "FIT software entry confirmed";
+                            AppState.message = "After the entry command, the FIT USB bootloader was detected. No firmware data or exit command was sent. Update mode is being held. Collect one support report; any restore needs a fresh check and separate confirmation.";
+                        } else if (AppState.status.equals("FIT_BOOTLOADER_PRESENT")) {
+                            AppState.title = "FIT bootloader already present";
+                            AppState.message = "The FIT USB bootloader was already present. Software entry was not tested, and no firmware data or exit command was sent. Collect one support report; any restore needs a fresh check and separate confirmation.";
+                        } else {
+                            AppState.title = "FIT entry not confirmed";
+                            AppState.message = e.optString("message", "No confirmed bootloader result.")
+                                    + "\nCollect one support report. A missing USB bootloader does not prove the controller is irrecoverable.";
+                        }
+                        AppState.persist(this);
+                        getSystemService(NotificationManager.class).notify(1, notification(AppState.title));
+                        return;
+                    }
                     if (mode.equals("restore")) {
                         // Success clears the hold only after clean helper exit.
                         if (AppState.status.equals("FAILED")
@@ -328,6 +368,22 @@ public final class RestoreService extends Service {
                 }
             }
         } catch (Exception ignored) { /* su/ART diagnostics are retained without becoming success. */ }
+    }
+
+    private static FitProbePolicy.Result parseProbeResult(JSONObject event) {
+        boolean complete = "kpfe-fit-root-restore/v1".equals(event.optString("schema"))
+                && "fit-entry-probe".equals(event.optString("mode")) && "FIT".equals(event.optString("profile"))
+                && event.opt("status") instanceof String && event.opt("cleanupError") instanceof String;
+        for (String field : new String[] {"softwareEntryAttempted", "softwareEntryConfirmed", "bootloaderObserved",
+                "controlStateChanged", "recoveryHoldRequested", "firmwareDataSent", "usbOpened", "quitSent",
+                "flashMayHaveStarted", "uartClosedVerified", "subprocessesStopped"})
+            complete &= event.opt(field) instanceof Boolean;
+        return new FitProbePolicy.Result(event.optString("status"), complete,
+                event.optBoolean("softwareEntryAttempted"), event.optBoolean("softwareEntryConfirmed"),
+                event.optBoolean("bootloaderObserved"), event.optBoolean("controlStateChanged"),
+                event.optBoolean("recoveryHoldRequested"), event.optBoolean("firmwareDataSent"),
+                event.optBoolean("usbOpened"), event.optBoolean("quitSent"), event.optBoolean("flashMayHaveStarted"),
+                event.optBoolean("uartClosedVerified"), event.optBoolean("subprocessesStopped"), event.optString("cleanupError"));
     }
 
     private String titleFor(String phase) {
